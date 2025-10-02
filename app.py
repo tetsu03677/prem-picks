@@ -7,7 +7,7 @@ st.set_page_config(page_title="Premier Picks", layout="centered")
 st.title("Premier Picks")
 st.caption("Googleスプレッドシート接続テスト（追記 & 上書き）")
 
-st.write("①『追記テスト』を押して1行追加 → ②『上書きテスト』で同じキーを上書きします。")
+st.write("①『追記テスト』で1行追加 → ②『上書きテスト』で同じキーを上書きします。")
 
 try:
     from google_sheets_client import append_bet, upsert_bet
@@ -43,7 +43,7 @@ with col2:
                 match="Arsenal vs West Ham",
                 user="Tetsu",
                 bet_team="Home",
-                stake=500,  # ← ここが上書きされるかを確認
+                stake=500,  # ← ここが上書きされるか確認
                 odds=1.9,
                 timestamp=ts
             )
