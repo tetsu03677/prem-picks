@@ -1,67 +1,97 @@
-# football_api.py  --- football-data.org からPLの直近試合を取得（JST & フォールバック）
+# football_api.py  --- football-data.orgからPLの直近試合を取得（JST & フォールバック）
 from __future__ import annotations
-import os
-import requests
+import os, requests
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import streamlit as st
 
-# --- gspreadを使わずに最小限でconfigシートを読む（既存のSecrets認証情報を再利用） ---
+# ---- helpers ----
+def _strip_token(v: str | None) -> str | None:
+    if not v:
+        return None
+    v = v.strip()
+    if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+        v = v[1:-1]
+    return v or None
+
 def _read_token_from_gsheet() -> str | None:
+    """configシートからFOOTBALL_DATA_API_TOKENを読む（あれば）。"""
     try:
         import gspread
         from google.oauth2.service_account import Credentials
 
-        # Secretsに入っているサービスアカウントJSONを復元
-        sa_keys = ["type","project_id","private_key_id","private_key","client_email",
-                   "client_id","auth_uri","token_uri","auth_provider_x509_cert_url","client_x509_cert_url"]
+        # Secretsにあるサービスアカウント情報（前のシート書き込みで動いていたもの）を再利用
+        sa_keys = [
+            "type","project_id","private_key_id","private_key","client_email",
+            "client_id","auth_uri","token_uri","auth_provider_x509_cert_url","client_x509_cert_url"
+        ]
         sa_info = {k: st.secrets[k] for k in sa_keys if k in st.secrets}
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
+            "https://www.googleapis.com/auth/drive",
         ]
         creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
         gc = gspread.authorize(creds)
 
         sheet_id = st.secrets["sheets"]["sheet_id"]
         sh = gc.open_by_key(sheet_id)
-        ws = sh.worksheet("config")  # 無ければ例外になる
-        rows = ws.get_all_records()  # [{'key': 'FOOTBALL_DATA_API_TOKEN', 'value': 'xxxxx'}, ...]
+
+        # タブ名は大小区別せずに "config" を探す
+        ws = None
+        for w in sh.worksheets():
+            if w.title.strip().lower() == "config":
+                ws = w
+                break
+        if not ws:
+            return None
+
+        vals = ws.get_all_values()
+        if not vals:
+            return None
+        header = [c.strip().lower() for c in vals[0]]
+        rows = [dict(zip(header, row)) for row in vals[1:]]
         for r in rows:
-            if str(r.get("key")).strip() == "FOOTBALL_DATA_API_TOKEN":
-                v = str(r.get("value")).strip()
-                return v if v else None
+            k = (r.get("key") or "").strip().upper()
+            if k == "FOOTBALL_DATA_API_TOKEN":
+                return _strip_token(r.get("value"))
     except Exception:
         return None
     return None
 
 def _load_token() -> str | None:
+    # 0) 画面からの一時オーバーライド（後述の app.py 変更で利用）
+    t = st.session_state.get("DEV_TOKEN_OVERRIDE")
+    if t:
+        return _strip_token(t)
+
     # 1) Secrets
-    token = st.secrets.get("FOOTBALL_DATA_API_TOKEN")
-    if token:
-        return str(token).strip()
-    # 2) 環境変数（将来の保険）
-    token = os.getenv("FOOTBALL_DATA_API_TOKEN")
-    if token:
-        return token.strip()
+    t = _strip_token(st.secrets.get("FOOTBALL_DATA_API_TOKEN"))
+    if t:
+        return t
+
+    # 2) 環境変数（保険）
+    t = _strip_token(os.getenv("FOOTBALL_DATA_API_TOKEN"))
+    if t:
+        return t
+
     # 3) Googleシート 'config'
     return _read_token_from_gsheet()
 
 BASE = "https://api.football-data.org/v4"
 
-@st.cache_data(ttl=600)  # 10分キャッシュで無料枠を節約
+@st.cache_data(ttl=600)  # 10分キャッシュ（無料枠セーフ）
 def get_pl_fixtures_next_days(days_ahead: int = 7) -> list[dict]:
-    """今日から days_ahead 日先までのPLのSCHEDULED試合を返す（JST整形済み）。"""
     token = _load_token()
     if not token:
         raise RuntimeError("APIトークンが見つかりません（Secrets か config シートを確認）。")
 
     today = datetime.now(timezone.utc).date()
-    date_from = today.isoformat()
-    date_to = (today + timedelta(days=days_ahead)).isoformat()
-
     url = f"{BASE}/competitions/PL/matches"
-    params = {"status": "SCHEDULED", "dateFrom": date_from, "dateTo": date_to}
+    params = {
+        "status": "SCHEDULED",
+        "dateFrom": today.isoformat(),
+        "dateTo": (today + timedelta(days=days_ahead)).isoformat(),
+    }
     headers = {"X-Auth-Token": token}
     r = requests.get(url, headers=headers, params=params, timeout=20)
     r.raise_for_status()
@@ -82,6 +112,5 @@ def get_pl_fixtures_next_days(days_ahead: int = 7) -> list[dict]:
             "away": (m.get("awayTeam") or {}).get("name"),
             "stage": m.get("stage"),
         })
-
     fixtures.sort(key=lambda x: x["kickoff_jst"])
     return fixtures
