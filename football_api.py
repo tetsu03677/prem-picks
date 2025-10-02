@@ -1,41 +1,65 @@
+# /football_api.py
 from __future__ import annotations
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from typing import List, Dict, Any, Optional
+
 from google_sheets_client import get_config_value
 
-API_BASE = "https://api.football-data.org/v4"
 JST = ZoneInfo("Asia/Tokyo")
+BASE = "https://api.football-data.org/v4"
 
-def _api_token() -> str:
-    token = get_config_value("FOOTBALL_DATA_API_TOKEN")
-    if not token:
-        raise RuntimeError("APIトークンがconfigシートにありません（FOOTBALL_DATA_API_TOKEN）。")
-    return token
+def _token() -> str:
+    tok = (get_config_value("FOOTBALL_DATA_API_TOKEN") or "").strip()
+    if not tok:
+        raise RuntimeError("config に FOOTBALL_DATA_API_TOKEN がありません。")
+    return tok
 
-def get_pl_fixtures_next_days(days: int = 7) -> list[dict]:
-    token = _api_token()
-    date_from = datetime.now(JST).date().isoformat()
-    date_to   = (datetime.now(JST) + timedelta(days=days)).date().isoformat()
-    url = f"{API_BASE}/competitions/PL/matches"
-    params = {"status": "SCHEDULED", "dateFrom": date_from, "dateTo": date_to}
-    headers = {"X-Auth-Token": token}
-
-    r = requests.get(url, params=params, headers=headers, timeout=20)
+def fetch_upcoming_pl_matches(days_ahead: int = 21) -> List[Dict[str, Any]]:
+    """今からdays_ahead日先までのSCHEDULED/TIMEDを取得してJST整形"""
+    token = _token()
+    now = datetime.now(JST)
+    params = {
+        "dateFrom": now.date().isoformat(),
+        "dateTo": (now + timedelta(days=days_ahead)).date().isoformat(),
+        "status": "SCHEDULED,TIMED",
+    }
+    r = requests.get(f"{BASE}/competitions/PL/matches", params=params, headers={"X-Auth-Token": token}, timeout=20)
     r.raise_for_status()
     data = r.json()
-
-    out = []
+    out: List[Dict[str, Any]] = []
     for m in data.get("matches", []):
         utc = m.get("utcDate")
-        ko_jst = None
-        if utc:
-            ko_jst = datetime.fromisoformat(utc.replace("Z", "+00:00")).astimezone(JST)
+        dt = datetime.fromisoformat(utc.replace("Z","+00:00")).astimezone(JST) if utc else None
         out.append({
             "matchday": m.get("matchday"),
             "id": m.get("id"),
             "home": (m.get("homeTeam") or {}).get("name"),
             "away": (m.get("awayTeam") or {}).get("name"),
-            "kickoff_jst": ko_jst.strftime("%Y-%m-%d %H:%M") if ko_jst else "",
+            "kickoff_jst": dt.strftime("%Y-%m-%d %H:%M") if dt else "",
+            "stage": m.get("stage"),
         })
+    out.sort(key=lambda x: x["kickoff_jst"])
     return out
+
+def pick_matchday_block(target_gw: str, matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """target_gw（例 'GW7'）のmatchday群を返す。無ければ target+1 のブロックを返す。"""
+    try:
+        tgt = int(target_gw.replace("GW","").strip())
+    except Exception:
+        return []
+    # グルーピング
+    groups: Dict[int, List[Dict[str, Any]]] = {}
+    for m in matches:
+        md = int(m.get("matchday") or 0)
+        if md <= 0: 
+            continue
+        groups.setdefault(md, []).append(m)
+    if tgt in groups:
+        return groups[tgt]
+    # 無ければ次に近い大きいMD
+    for k in sorted(groups.keys()):
+        if k > tgt:
+            return groups[k]
+    return []
