@@ -1,5 +1,5 @@
+# /requirements.txt
 streamlit==1.37.0
 gspread==5.12.4
 google-auth==2.33.0
-requests==2.32.3
-# rebuild
+pandas==2.2.2
