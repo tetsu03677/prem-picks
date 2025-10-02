@@ -1,62 +1,60 @@
-# repo-root/football_api.py
-from __future__ import annotations
+# /football_api.py
+import os
 import requests
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 import streamlit as st
+from datetime import datetime, timedelta, timezone
 
-API_BASE = "https://api.football-data.org/v4"
-JST = ZoneInfo("Asia/Tokyo")
+JST = timezone(timedelta(hours=9))
 
+def _get_api_token() -> str:
+    # Secrets → 環境変数の順で取得（見つからなければ空文字）
+    token = st.secrets.get("FOOTBALL_DATA_API_TOKEN") or os.environ.get("FOOTBALL_DATA_API_TOKEN", "")
+    return token.strip()
 
-def _get_headers() -> dict:
-    """Secrets から安全にトークンを読む（未設定なら分かりやすく止める）"""
-    token = st.secrets.get("FOOTBALL_DATA_API_TOKEN")
+def get_pl_fixtures_next_days(days: int = 7):
+    """
+    football-data.org から、今日を含む days 日先までのプレミアリーグ日程を取得して返す。
+    トークン未設定時は (False, エラーメッセージ) を返す。
+    """
+    token = _get_api_token()
     if not token:
-        # ここで KeyError を起こさず、アプリ側で例外表示できるようにする
-        raise RuntimeError("FOOTBALL_DATA_API_TOKEN が Secrets にありません。Settings → Secrets に追加して保存してください。")
-    return {"X-Auth-Token": token}
+        return False, "FOOTBALL_DATA_API_TOKEN が Secrets にありません。Settings→Secrets に追加して保存してください。"
 
+    headers = {"X-Auth-Token": token}
+    base = "https://api.football-data.org/v4/matches"
 
-def _iso_utc_to_jst_string(iso_utc: str) -> str:
-    """'2025-10-02T11:30:00Z' → '2025-10-02 Thu 20:30 JST'"""
-    dt_utc = datetime.fromisoformat(iso_utc.replace("Z", "+00:00"))
-    dt_jst = dt_utc.astimezone(JST)
-    return dt_jst.strftime("%Y-%m-%d %a %H:%M JST")
-
-
-@st.cache_data(ttl=900)  # 15分キャッシュで無料枠を節約
-def get_pl_fixtures_next_days(days: int = 10) -> list[dict]:
-    """
-    プレミアリーグの『今からdays日先まで』のSCHEDULED試合を取得。
-    返り値: [{kickoff_jst, homeTeam, awayTeam, matchday, id}, ...]
-    """
-    today = datetime.now(timezone.utc).date()
-    date_from = today.isoformat()
-    date_to = (today + timedelta(days=days)).isoformat()
+    date_from = datetime.now(JST).date().isoformat()
+    date_to = (datetime.now(JST).date() + timedelta(days=days)).isoformat()
 
     params = {
-        "competitions": "PL",
-        "status": "SCHEDULED",
         "dateFrom": date_from,
         "dateTo": date_to,
+        "competitions": "PL",  # Premier League
+        "status": "SCHEDULED"
     }
-    url = f"{API_BASE}/matches"
-    headers = _get_headers()  # ← ここで初めてSecrets参照
-    r = requests.get(url, headers=headers, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
 
-    fixtures = []
-    for m in data.get("matches", []):
-        fixtures.append(
-            {
-                "id": m["id"],
-                "matchday": m.get("matchday"),
-                "kickoff_jst": _iso_utc_to_jst_string(m["utcDate"]),
-                "homeTeam": m["homeTeam"]["name"],
-                "awayTeam": m["awayTeam"]["name"],
-            }
-        )
-    fixtures.sort(key=lambda x: x["kickoff_jst"])
-    return fixtures
+    try:
+        r = requests.get(base, headers=headers, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        matches = []
+        for m in data.get("matches", []):
+            utc = m.get("utcDate")
+            dt = datetime.fromisoformat(utc.replace("Z","+00:00")).astimezone(JST) if utc else None
+            home = m.get("homeTeam", {}).get("name")
+            away = m.get("awayTeam", {}).get("name")
+            comp = m.get("competition", {}).get("code")
+            matches.append({
+                "kickoff_jst": dt.strftime("%Y-%m-%d %H:%M") if dt else "",
+                "home": home, "away": away, "competition": comp
+            })
+        return True, matches
+    except requests.HTTPError as e:
+        # トークン不正などのときは本文も返す
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text
+        return False, f"HTTP {r.status_code}: {body}"
+    except Exception as e:
+        return False, f"取得エラー: {e}"
