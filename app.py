@@ -1,33 +1,40 @@
+# /app.py
 from __future__ import annotations
 import streamlit as st
-from football_api import get_pl_fixtures_next_days
-from google_sheets_client import read_config_dict
+from google_sheets_client import ensure_basics, list_users, get_user
 
 st.set_page_config(page_title="Premier Picks", page_icon="⚽", layout="centered")
-st.title("Premier Picks")
-st.subheader("直近のプレミア日程（API＋トークンはconfigシートから取得）")
 
-# ── 診断：configから読めたキーを表示（本番で邪魔なら消せます）
-with st.expander("🔧 接続トラブル時の診断（読めたconfigキー）"):
-    cfg = read_config_dict()
-    keys = ", ".join(sorted(cfg.keys())) if cfg else "(空)"
-    st.caption(f"configシートから読めたキー: {keys}")
-    st.caption("※ シート名は小文字の config、1行目は key / value 推奨")
+# 初期セットアップ（足りないシート/ヘッダを自動作成）
+with st.spinner("初期セットアップ中..."):
+    ensure_basics()
 
-days = st.slider("何日先まで表示するか", 3, 14, 10)
+def _login_card():
+    st.markdown("<div style='text-align:center;'><h1 style='margin-bottom:0.2rem;'>Premier Picks</h1><p>ログイン</p></div>", unsafe_allow_html=True)
+    st.write("")
+    colA,colB,colC = st.columns([1,2,1])
+    with colB:
+        with st.container(border=True):
+            users = list_users()
+            names = [u.get("username") for u in users]
+            username = st.selectbox("ユーザー名", names, index=0 if names else None)
+            password = st.text_input("パスワード", type="password")
+            ok = st.button("ログイン", type="primary", use_container_width=True)
+            if ok:
+                u = get_user(username)
+                if not u or (u.get("password") or "") != password:
+                    st.error("ユーザー名またはパスワードが違います。")
+                else:
+                    st.session_state["user"] = {
+                        "username": u["username"],
+                        "role": u.get("role","user"),
+                        "team": u.get("team",""),
+                    }
+                    st.success("ログイン成功")
+                    st.switch_page("pages/02_試合とベット.py")
 
-try:
-    fixtures = get_pl_fixtures_next_days(days)
-except Exception as e:
-    st.error(f"試合データの取得に失敗しました。{e}")
-    st.stop()
-
-if not fixtures:
-    st.info("指定期間内の試合が見つかりませんでした。")
+# すでにログインしていたらベットページに飛ばす
+if "user" in st.session_state:
+    st.switch_page("pages/02_試合とベット.py")
 else:
-    for f in fixtures:
-        st.markdown(
-            f"### {f.get('home')} vs {f.get('away')}\n"
-            f"🕒 {f.get('kickoff_jst')} JST | GW: {f.get('matchday')} | ID: {f.get('id')}"
-        )
-        st.divider()
+    _login_card()
