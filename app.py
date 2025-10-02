@@ -1,81 +1,72 @@
-# prem-picks/app.py
+# app.py  --- 直近のプレミア日程表示 + Googleシート接続テスト
+from __future__ import annotations
 import streamlit as st
-from datetime import datetime
 from football_api import get_pl_fixtures_next_days
+from google_sheets_client import append_bet, upsert_bet
+from datetime import datetime
 
-st.set_page_config(page_title="Premier Picks", layout="centered")
+st.set_page_config(page_title="Premier Picks", page_icon="⚽", layout="centered")
 
 st.title("Premier Picks")
+st.subheader("直近のプレミア日程（本物データ）")
 
-# ==== 本物データ：直近のプレミア日程（7〜10日先まで） =========================
-st.subheader("直近のプレミア日程（本物データ）", anchor=False)
-col_l, col_r = st.columns([1,1])
-with col_l:
-    days = st.slider("何日先まで表示するか", 3, 14, 10)
+days = st.slider("何日先まで表示するか", 3, 14, 10)
 
-fixtures = []
-error_msg = None
+# ===== 試合表示 =====
 try:
     fixtures = get_pl_fixtures_next_days(days)
+    if not fixtures:
+        st.info("期間内に予定された試合が見つかりませんでした。")
+    else:
+        for f in fixtures:
+            # ここは f は必ず辞書。キー欠損も考慮して安全に表示
+            md = f.get("matchday", "?")
+            ko = f.get("kickoff_jst", "?")
+            home = f.get("home", "?")
+            away = f.get("away", "?")
+            st.markdown(f"**GW {md}**　{ko}（JST）　{home} vs {away}")
 except Exception as e:
-    error_msg = f"試合データの取得に失敗しました: {e}"
+    st.error(
+        "試合データの取得に失敗しました。Secretsの設定をご確認ください。\n\n"
+        f"詳細: {e}"
+    )
 
-if error_msg:
-    st.error(error_msg)
-elif not fixtures:
-    st.info("表示できる試合がありません。")
-else:
-    for f in fixtures:
-        with st.container(border=True):
-            st.markdown(
-                f"**GW {f.get('matchday','?')}** 　"
-                f"{f['kickoff_jst']} 　"
-                f"{f['homeTeam']}  vs  {f['awayTeam']}"
-            )
-# =============================================================================
+st.divider()
 
-st.caption("Googleスプレッドシート接続テスト（追記 & 上書き）")
+# ===== Googleスプレッドシート接続テスト（既存のまま） =====
+st.caption("Googleスプレッドシート接続テスト（追記＆上書き）")
 
-st.write("①『追記テスト』で1行追加 → ②『上書きテスト』で同じキーを上書きします。")
-
-try:
-    from google_sheets_client import append_bet, upsert_bet
-except Exception:
-    st.error("google_sheets_client.py が見つかりません。先に追加/置き換えしてください。")
-    st.stop()
-
-col1, col2 = st.columns(2)
-
-with col1:
-    if st.button("追記テスト（append）", type="primary", use_container_width=True):
+colA, colB = st.columns(2)
+with colA:
+    if st.button("追記テスト（append）", type="primary"):
         try:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             append_bet(
                 gw="GW7",
-                match="Arsenal vs West Ham",
+                match="Arsenal vs West",
                 user="Tetsu",
                 bet_team="Home",
                 stake=100,
-                odds=1.9,
-                timestamp=ts
+                odds=1.90,
+                timestamp=ts,
             )
-            st.success("追記しました（bets に新しい行が追加）")
+            st.success("Googleシートに追記しました！Driveで確認してください。")
         except Exception as e:
-            st.exception(e)
+            st.error(f"追記に失敗: {e}")
 
-with col2:
-    if st.button("上書きテスト（upsert）", use_container_width=True):
+with colB:
+    if st.button("上書きテスト（upsert）"):
         try:
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            result = upsert_bet(
-                gw="GW7",
-                match="Arsenal vs West Ham",
-                user="Tetsu",
-                bet_team="Home",
-                stake=500,  # ← ここが上書きされるか確認
-                odds=1.9,
-                timestamp=ts
+            upsert_bet(
+                key_cols={"gw": "GW7", "user": "Tetsu"},
+                update_cols={
+                    "match": "Arsenal vs West",
+                    "bet_team": "Home",
+                    "stake": 200,
+                    "odds": 1.95,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                },
             )
-            st.success(f"アップサート完了（{result}）")
+            st.success("同じキーの行を上書きしました！")
         except Exception as e:
-            st.exception(e)
+            st.error(f"上書きに失敗: {e}")
