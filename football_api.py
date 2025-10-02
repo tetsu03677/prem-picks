@@ -1,30 +1,34 @@
 # repo-root/football_api.py
-
 from __future__ import annotations
-import os
 import requests
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-
 import streamlit as st
 
 API_BASE = "https://api.football-data.org/v4"
-HEADERS = {"X-Auth-Token": st.secrets["FOOTBALL_DATA_API_TOKEN"]}
-
 JST = ZoneInfo("Asia/Tokyo")
 
 
+def _get_headers() -> dict:
+    """Secrets から安全にトークンを読む（未設定なら分かりやすく止める）"""
+    token = st.secrets.get("FOOTBALL_DATA_API_TOKEN")
+    if not token:
+        # ここで KeyError を起こさず、アプリ側で例外表示できるようにする
+        raise RuntimeError("FOOTBALL_DATA_API_TOKEN が Secrets にありません。Settings → Secrets に追加して保存してください。")
+    return {"X-Auth-Token": token}
+
+
 def _iso_utc_to_jst_string(iso_utc: str) -> str:
-    """'2025-10-02T11:30:00Z' → '2025-10-02 Thu 20:30 JST' のような表示に変換"""
+    """'2025-10-02T11:30:00Z' → '2025-10-02 Thu 20:30 JST'"""
     dt_utc = datetime.fromisoformat(iso_utc.replace("Z", "+00:00"))
     dt_jst = dt_utc.astimezone(JST)
     return dt_jst.strftime("%Y-%m-%d %a %H:%M JST")
 
 
-@st.cache_data(ttl=900)  # 15分キャッシュで無料枠の呼び出し回数を節約
+@st.cache_data(ttl=900)  # 15分キャッシュで無料枠を節約
 def get_pl_fixtures_next_days(days: int = 10) -> list[dict]:
     """
-    プレミアリーグ(PL)の「今からdays日先まで」のSCHEDULED試合を取得。
+    プレミアリーグの『今からdays日先まで』のSCHEDULED試合を取得。
     返り値: [{kickoff_jst, homeTeam, awayTeam, matchday, id}, ...]
     """
     today = datetime.now(timezone.utc).date()
@@ -38,9 +42,10 @@ def get_pl_fixtures_next_days(days: int = 10) -> list[dict]:
         "dateTo": date_to,
     }
     url = f"{API_BASE}/matches"
-    r = requests.get(url, headers=HEADERS, params=params, timeout=20)
+    headers = _get_headers()  # ← ここで初めてSecrets参照
+    r = requests.get(url, headers=headers, params=params, timeout=20)
     r.raise_for_status()
-    data = r.json()  # freeプランでもこのエンドポイントは使えます
+    data = r.json()
 
     fixtures = []
     for m in data.get("matches", []):
@@ -53,6 +58,5 @@ def get_pl_fixtures_next_days(days: int = 10) -> list[dict]:
                 "awayTeam": m["awayTeam"]["name"],
             }
         )
-    # キックオフ昇順
     fixtures.sort(key=lambda x: x["kickoff_jst"])
     return fixtures
