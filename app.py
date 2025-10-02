@@ -1,10 +1,39 @@
 # prem-picks/app.py
 import streamlit as st
 from datetime import datetime
+from football_api import get_pl_fixtures_next_days
 
 st.set_page_config(page_title="Premier Picks", layout="centered")
 
 st.title("Premier Picks")
+
+# ==== 本物データ：直近のプレミア日程（7〜10日先まで） =========================
+st.subheader("直近のプレミア日程（本物データ）", anchor=False)
+col_l, col_r = st.columns([1,1])
+with col_l:
+    days = st.slider("何日先まで表示するか", 3, 14, 10)
+
+fixtures = []
+error_msg = None
+try:
+    fixtures = get_pl_fixtures_next_days(days)
+except Exception as e:
+    error_msg = f"試合データの取得に失敗しました: {e}"
+
+if error_msg:
+    st.error(error_msg)
+elif not fixtures:
+    st.info("表示できる試合がありません。")
+else:
+    for f in fixtures:
+        with st.container(border=True):
+            st.markdown(
+                f"**GW {f.get('matchday','?')}** 　"
+                f"{f['kickoff_jst']} 　"
+                f"{f['homeTeam']}  vs  {f['awayTeam']}"
+            )
+# =============================================================================
+
 st.caption("Googleスプレッドシート接続テスト（追記 & 上書き）")
 
 st.write("①『追記テスト』で1行追加 → ②『上書きテスト』で同じキーを上書きします。")
