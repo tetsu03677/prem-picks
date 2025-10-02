@@ -1,29 +1,26 @@
-# football_api.py  --- football-data.orgからPLの直近試合を取得（JST & フォールバック）
+# football_api.py
 from __future__ import annotations
-import os, requests
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+
+import requests
 import streamlit as st
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-# ---- helpers ----
-def _strip_token(v: str | None) -> str | None:
-    if not v:
-        return None
-    v = v.strip()
-    if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
-        v = v[1:-1]
-    return v or None
+# ===== 内部ユーティリティ =====
+def _to_jst_str(utc_iso: str) -> str:
+    # '2025-10-20T15:30:00Z' -> 'YYYY-MM-DD HH:MM' (JST)
+    dt = datetime.fromisoformat(utc_iso.replace("Z", "+00:00"))
+    return dt.astimezone(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d %H:%M")
 
-def _read_token_from_gsheet() -> str | None:
-    """configシートからFOOTBALL_DATA_API_TOKENを読む（あれば）。"""
+def _get_token_from_config_sheet() -> str | None:
+    """Googleシートの 'config' シートから key/value を読み、FOOTBALL_DATA_API_TOKEN を返す。"""
     try:
         import gspread
         from google.oauth2.service_account import Credentials
 
-        # Secretsにあるサービスアカウント情報（前のシート書き込みで動いていたもの）を再利用
         sa_keys = [
             "type","project_id","private_key_id","private_key","client_email",
-            "client_id","auth_uri","token_uri","auth_provider_x509_cert_url","client_x509_cert_url"
+            "client_id","auth_uri","token_uri","auth_provider_x509_cert_url","client_x509_cert_url",
         ]
         sa_info = {k: st.secrets[k] for k in sa_keys if k in st.secrets}
         scopes = [
@@ -35,82 +32,81 @@ def _read_token_from_gsheet() -> str | None:
 
         sheet_id = st.secrets["sheets"]["sheet_id"]
         sh = gc.open_by_key(sheet_id)
-
-        # タブ名は大小区別せずに "config" を探す
-        ws = None
-        for w in sh.worksheets():
-            if w.title.strip().lower() == "config":
-                ws = w
-                break
-        if not ws:
+        try:
+            ws = sh.worksheet("config")
+        except Exception:
             return None
 
-        vals = ws.get_all_values()
-        if not vals:
-            return None
-        header = [c.strip().lower() for c in vals[0]]
-        rows = [dict(zip(header, row)) for row in vals[1:]]
+        rows = ws.get_all_records()  # 1行目は header: key / value
         for r in rows:
-            k = (r.get("key") or "").strip().upper()
-            if k == "FOOTBALL_DATA_API_TOKEN":
-                return _strip_token(r.get("value"))
+            k = str(r.get("key") or r.get("Key") or r.get("KEY") or "").strip()
+            v = str(r.get("value") or r.get("Value") or r.get("VALUE") or "").strip()
+            if k.upper() == "FOOTBALL_DATA_API_TOKEN" and v:
+                return v
+        return None
     except Exception:
         return None
-    return None
 
-def _load_token() -> str | None:
-    # 0) 画面からの一時オーバーライド（後述の app.py 変更で利用）
-    t = st.session_state.get("DEV_TOKEN_OVERRIDE")
-    if t:
-        return _strip_token(t)
+def _get_api_token() -> str:
+    # 1) 画面からの一時トークン最優先
+    ov = st.session_state.get("DEV_TOKEN_OVERRIDE")
+    if isinstance(ov, str) and ov.strip():
+        return ov.strip()
+    # 2) Secrets
+    tok = st.secrets.get("FOOTBALL_DATA_API_TOKEN")
+    if isinstance(tok, str) and tok.strip():
+        return tok.strip()
+    # 3) config シート
+    tok = _get_token_from_config_sheet()
+    if tok:
+        return tok
+    raise RuntimeError("APIトークンが見つかりません（Secrets か config シートを確認）。")
 
-    # 1) Secrets
-    t = _strip_token(st.secrets.get("FOOTBALL_DATA_API_TOKEN"))
-    if t:
-        return t
+def _call_football_data(path: str, params: dict | None = None) -> dict:
+    url = f"https://api.football-data.org/v4{path}"
+    headers = {"X-Auth-Token": _get_api_token()}
+    r = requests.get(url, headers=headers, params=params or {}, timeout=15)
 
-    # 2) 環境変数（保険）
-    t = _strip_token(os.getenv("FOOTBALL_DATA_API_TOKEN"))
-    if t:
-        return t
+    if r.status_code == 401:
+        raise RuntimeError("APIトークンが無効（401）。FOOTBALL_DATA_API_TOKEN を見直してください。")
+    if r.status_code == 403:
+        raise RuntimeError("レート制限/権限制限（403）。時間をおいて再実行してください。")
+    if r.status_code >= 400:
+        # 返却本文を少しだけ添える
+        snippet = r.text[:200].replace("\n", " ")
+        raise RuntimeError(f"APIエラー: {r.status_code} {snippet}")
+    return r.json()
 
-    # 3) Googleシート 'config'
-    return _read_token_from_gsheet()
+# ===== 公開関数 =====
+def get_pl_fixtures_next_days(days: int = 7) -> list[dict]:
+    """
+    直近 days 日のプレミアリーグ公式日程を返す。
+    返却: [{'kickoff_jst','matchday','home','away','stage'}, ...]
+    """
+    now_jst = datetime.now(ZoneInfo("Asia/Tokyo"))
+    date_from = now_jst.date().isoformat()
+    date_to = (now_jst + timedelta(days=days)).date().isoformat()
 
-BASE = "https://api.football-data.org/v4"
-
-@st.cache_data(ttl=600)  # 10分キャッシュ（無料枠セーフ）
-def get_pl_fixtures_next_days(days_ahead: int = 7) -> list[dict]:
-    token = _load_token()
-    if not token:
-        raise RuntimeError("APIトークンが見つかりません（Secrets か config シートを確認）。")
-
-    today = datetime.now(timezone.utc).date()
-    url = f"{BASE}/competitions/PL/matches"
-    params = {
-        "status": "SCHEDULED",
-        "dateFrom": today.isoformat(),
-        "dateTo": (today + timedelta(days=days_ahead)).isoformat(),
-    }
-    headers = {"X-Auth-Token": token}
-    r = requests.get(url, headers=headers, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-
-    fixtures = []
-    for m in data.get("matches", []):
-        utc_raw = m.get("utcDate")
-        if not utc_raw:
-            continue
-        dt_utc = datetime.fromisoformat(utc_raw.replace("Z", "+00:00"))
-        dt_jst = dt_utc.astimezone(ZoneInfo("Asia/Tokyo"))
-        fixtures.append({
-            "id": m.get("id"),
-            "matchday": m.get("matchday"),
-            "kickoff_jst": dt_jst.strftime("%Y-%m-%d %H:%M"),
-            "home": (m.get("homeTeam") or {}).get("name"),
-            "away": (m.get("awayTeam") or {}).get("name"),
-            "stage": m.get("stage"),
-        })
-    fixtures.sort(key=lambda x: x["kickoff_jst"])
-    return fixtures
+    data = _call_football_data(
+        "/competitions/PL/matches",
+        params={
+            "dateFrom": date_from,
+            "dateTo": date_to,
+            # SCHEDULED と TIMED を含めて将来試合を拾う
+            "status": "SCHEDULED,TIMED",
+        },
+    )
+    matches = data.get("matches", [])
+    out = []
+    for m in matches:
+        out.append(
+            {
+                "kickoff_jst": _to_jst_str(m.get("utcDate", "")),
+                "matchday": m.get("matchday"),
+                "home": (m.get("homeTeam") or {}).get("name"),
+                "away": (m.get("awayTeam") or {}).get("name"),
+                "stage": m.get("stage"),
+            }
+        )
+    out.sort(key=lambda x: x["kickoff_jst"])
+    return out
