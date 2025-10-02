@@ -5,14 +5,17 @@ from google_sheets_client import ensure_basics, list_users, get_user
 
 st.set_page_config(page_title="Premier Picks", page_icon="⚽", layout="centered")
 
-# 初期セットアップ（足りないシート/ヘッダを自動作成）
+# 初期セットアップ（不足シート/ヘッダを自動作成）
 with st.spinner("初期セットアップ中..."):
     ensure_basics()
 
 def _login_card():
-    st.markdown("<div style='text-align:center;'><h1 style='margin-bottom:0.2rem;'>Premier Picks</h1><p>ログイン</p></div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div style='text-align:center;'><h1 style='margin-bottom:0.2rem;'>Premier Picks</h1><p>ログイン</p></div>",
+        unsafe_allow_html=True,
+    )
     st.write("")
-    colA,colB,colC = st.columns([1,2,1])
+    colA, colB, colC = st.columns([1, 2, 1])
     with colB:
         with st.container(border=True):
             users = list_users()
@@ -27,14 +30,14 @@ def _login_card():
                 else:
                     st.session_state["user"] = {
                         "username": u["username"],
-                        "role": u.get("role","user"),
-                        "team": u.get("team",""),
+                        "role": u.get("role", "user"),
+                        "team": u.get("team", ""),
                     }
                     st.success("ログイン成功")
-                    st.switch_page("pages/02_試合とベット.py")
+                    st.switch_page("pages/02_Bets.py")
 
-# すでにログインしていたらベットページに飛ばす
+# すでにログインしていたらベットページへ
 if "user" in st.session_state:
-    st.switch_page("pages/02_試合とベット.py")
+    st.switch_page("pages/02_Bets.py")
 else:
     _login_card()
