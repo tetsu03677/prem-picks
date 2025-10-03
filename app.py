@@ -9,7 +9,7 @@ from dateutil.tz import gettz
 from google_sheets_client import read_config, read_rows_by_sheet, upsert_row
 from football_api import fetch_matches_next_window, simplify_matches
 
-# set_page_config は最上段で
+# 最上段で設定
 st.set_page_config(page_title="Premier Picks", page_icon="⚽", layout="wide")
 
 
@@ -25,7 +25,6 @@ def ensure_auth(conf: Dict[str, str]) -> Dict[str, Any]:
     except Exception:
         users = []
 
-    # 既ログイン
     if "user" in st.session_state and st.session_state["user"]:
         return st.session_state["user"]
 
@@ -89,7 +88,7 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict[str, Any]):
     tzname = conf.get("timezone", "Asia/Tokyo")
     matches = simplify_matches(raw, tzname)
 
-    # 最初のKOから凍結閾値
+    # 凍結閾値（最初のKOの N 分前）
     first_ko_utc = matches[0]["utc_kickoff"] if matches else dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
     freeze_min = int(conf.get("odds_freeze_minutes_before_first", conf.get("odds_freeze_minutes_before_first", "120")) or 120)
     freeze_utc = first_ko_utc - dt.timedelta(minutes=freeze_min)
@@ -104,7 +103,11 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict[str, Any]):
         with st.container(border=True):
             st.markdown(f"**{m['gw']}** ・ {m['local_kickoff'].strftime('%m/%d %H:%M')}")
             locked = now_utc >= freeze_utc
-            st.success("OPEN", icon="✅") if not locked else st.error("LOCKED", icon="🔒")
+            # ★ ここを if/else に変更（Streamlit の “魔法” による自動 write を回避）
+            if not locked:
+                st.success("OPEN", icon="✅")
+            else:
+                st.error("LOCKED", icon="🔒")
 
             # ホーム太字＆少し大きく
             st.markdown(
@@ -117,7 +120,7 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict[str, Any]):
                 st.info("オッズ未入力のため**仮オッズ (=1.0)** を表示中。管理者は『オッズ管理』で設定してください。")
             st.write(f"Home: {om['home']:.2f} ・ Draw: {om['draw']:.2f} ・ Away: {om['away']:.2f}")
 
-            # 他ユーザーのベット状況（非テーブル）
+            # 他ユーザーのベット状況
             others = [b for b in all_bets if b.get("match_id")==m["id"]]
             if others:
                 chips = [f"{b.get('user')}: {b.get('pick')} {b.get('stake')}" for b in others]
@@ -131,7 +134,7 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict[str, Any]):
                     mine = b
                     break
 
-            # Segmented control (1.38 以降)
+            # Segmented control
             default_pick = (mine or {}).get("pick", "HOME")
             pick = st.segmented_control("ピック", options=["HOME","DRAW","AWAY"], default=default_pick)
             step = int(conf.get("stake_step","100") or 100)
