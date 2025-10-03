@@ -1,12 +1,17 @@
 # google_sheets_client.py
 from __future__ import annotations
-from typing import Dict, Any
-import gspread
+from typing import Dict, List, Any
+from datetime import datetime, timezone
+import json
 import streamlit as st
+import gspread
+
+UTC = timezone.utc
 
 # ── 接続 ─────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def _gc():
+    # secrets.toml の gcp_service_account を使用
     creds_dict = st.secrets["gcp_service_account"]
     return gspread.service_account_from_dict(creds_dict)
 
@@ -18,44 +23,84 @@ def _sh():
 def ws(name: str):
     return _sh().worksheet(name)
 
-# ── config 読み込み ─────────────────────────────────────────────
+# ── config の key-value を dict で取得 ──────────────────────────
 @st.cache_data(ttl=60, show_spinner=False)
 def read_config() -> Dict[str, str]:
-    rows = ws("config").get_all_records()
-    conf = {}
-    for row in rows:
+    data = ws("config").get_all_records()
+    conf: Dict[str, str] = {}
+    for row in data:
         k = str(row.get("key", "")).strip()
         v = str(row.get("value", "")).strip()
         if k:
             conf[k] = v
     return conf
 
-# ── odds 読み込み（map: match_id -> dict）────────────────────────
+# ── odds を指定GWで {match_id: {...}} に整形して返す ───────────────
 @st.cache_data(ttl=30, show_spinner=False)
-def read_odds_map_for_gw(gw: int) -> Dict[str, Dict[str, float]]:
-    """
-    odds シートの該当GWを辞書化
-    { str(match_id): {"home": float, "draw": float, "away": float, "locked": bool} }
-    """
-    try:
-        rows = ws("odds").get_all_records()
-    except Exception:
-        rows = []
-    m: Dict[str, Dict[str, float]] = {}
+def read_odds_map_for_gw(gw: int) -> Dict[str, Dict[str, Any]]:
+    sheet = ws("odds")
+    rows = sheet.get_all_records()
+    odmap: Dict[str, Dict[str, Any]] = {}
     for r in rows:
-        try:
-            if str(r.get("gw")).strip() != str(gw):
-                continue
-            match_id = str(r.get("match_id")).strip()
-            if not match_id:
-                continue
-            m[match_id] = {
-                "home": float(r.get("home_win") or 0) or 0.0,
-                "draw": float(r.get("draw") or 0) or 0.0,
-                "away": float(r.get("away_win") or 0) or 0.0,
-                "locked": str(r.get("locked") or "").strip().lower() in ("1", "true", "yes"),
-            }
-        except Exception:
-            # 変な行はスキップ
-            pass
-    return m
+        if str(r.get("gw", "")).strip() != str(gw):
+            continue
+        mid = str(r.get("match_id", "")).strip()
+        if not mid:
+            continue
+        odmap[mid] = {
+            "home": float(r.get("home_win", 0) or 0),
+            "draw": float(r.get("draw", 0) or 0),
+            "away": float(r.get("away_win", 0) or 0),
+            "locked": bool(r.get("locked", False)),
+            "updated_at": r.get("updated_at", ""),
+        }
+    return odmap
+
+# ── bets 合計金額（そのGWの自分の投票合計）を算出 ────────────────
+@st.cache_data(ttl=10, show_spinner=False)
+def user_total_stake_for_gw(user: str, gw: int) -> int:
+    sheet = ws("bets")
+    rows = sheet.get_all_records()
+    total = 0
+    for r in rows:
+        if str(r.get("gw", "")) == str(gw) and str(r.get("user", "")) == user:
+            try:
+                total += int(float(r.get("stake", 0) or 0))
+            except Exception:
+                pass
+    return total
+
+# ── ベットを一行追記 ─────────────────────────────────────────────
+def append_bet_row(
+    gw: int,
+    user: str,
+    match_id: str,
+    match_label: str,
+    pick: str,          # "HOME" / "DRAW" / "AWAY"
+    stake: int,
+    odds: float,
+) -> None:
+    sheet = ws("bets")
+    now_utc = datetime.now(UTC).isoformat()
+    key = f"{gw}-{user}-{match_id}-{int(datetime.now().timestamp())}"
+
+    # シート列: key, gw, user, match_id, match, pick, stake, odds, placed_at, status, result, payout, net, settled_at
+    row = [
+        key,
+        gw,
+        user,
+        match_id,
+        match_label,
+        pick,
+        stake,
+        odds,
+        now_utc,
+        "OPEN",
+        "",     # result
+        "",     # payout
+        "",     # net
+        "",     # settled_at
+    ]
+    sheet.append_row(row, value_input_option="USER_ENTERED")
+    # 合計額キャッシュをクリア
+    user_total_stake_for_gw.clear()
