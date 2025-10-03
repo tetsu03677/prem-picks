@@ -16,13 +16,12 @@ def _iso(d: dt.date) -> str:
 
 def fetch_matches_next_window(days: int, competition: str, season: str, token: str) -> Tuple[List[Dict[str, Any]], str]:
     """
-    次の 'days' 日間の SCHEDULED 試合を取得（competition は 'PL' などのコードや ID でも可）
-    返り値: (matches, reason)
+    次の 'days' 日間の SCHEDULED 試合を取得（competition は 'PL' 等のコード or 数値ID どちらでも可）
     """
-    today = dt.date.today()
-    end = today + dt.timedelta(days=days)
+    start = dt.date.today()
+    end = start + dt.timedelta(days=days)
     params = {
-        "dateFrom": _iso(today),
+        "dateFrom": _iso(start),
         "dateTo": _iso(end),
         "season": season,
         "status": "SCHEDULED",
@@ -30,12 +29,10 @@ def fetch_matches_next_window(days: int, competition: str, season: str, token: s
     url = f"{BASE}/competitions/{competition}/matches"
     r = requests.get(url, headers=_hdr(token), params=params, timeout=20)
     if r.status_code == 404:
-        # 無い場合は空を返す
         return [], "no_window"
     r.raise_for_status()
     data = r.json()
-    matches = data.get("matches", [])
-    return matches, "ok"
+    return data.get("matches", []), "ok"
 
 def simplify_matches(raw: List[Dict[str, Any]], tz_name: str) -> List[Dict[str, Any]]:
     tz = gettz(tz_name) or gettz("UTC")
@@ -53,6 +50,5 @@ def simplify_matches(raw: List[Dict[str, Any]], tz_name: str) -> List[Dict[str, 
             "away": m["awayTeam"]["name"],
             "status": m.get("status", ""),
         })
-    # kick-off で昇順
     out.sort(key=lambda x: x["utc_kickoff"])
     return out
