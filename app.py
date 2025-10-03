@@ -1,3 +1,8 @@
+# app.py の先頭（他の import より先）
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
 import json
 from datetime import datetime, timezone
 import pytz
