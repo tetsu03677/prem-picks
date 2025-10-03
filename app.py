@@ -1,311 +1,223 @@
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import pytz
 import streamlit as st
+from streamlit_option_menu import option_menu
 
-import streamlit as st
+# 既存のシート接続ヘルパー（前に置いたもの）を利用
+from google_sheets_client import read_config, ws
 
-# ← ここで最初にページ設定を一度だけ
-st.set_page_config(
-    page_title="Premier Picks",
-    page_icon="⚽",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+# -----------------------------
+# ページ基本設定 & カスタムCSS
+# -----------------------------
+st.set_page_config(page_title="Premier Picks", page_icon="⚽", layout="wide")
 
-from google_sheets_client import read_config, upsert_bet_row, read_bets
-from football_api import get_next_fixtures
-
-# ====== Global style (simple & clean) ======
-STYLES = """
+_UI_CSS = """
 <style>
-/* base */
-:root { --accent:#e24c4c; }
-section.main { padding-top: 1.2rem; }
-.block-container { padding-top: 1.2rem; max-width: 980px; }
-h1, h2, h3 { letter-spacing: .02em; }
-hr { border: none; border-top: 1px solid #2a2d33; margin: 1.25rem 0; }
-
-/* cards */
-.card {
-  background: #1e2229;
-  border: 1px solid #323843;
-  border-radius: 14px;
-  padding: 14px 16px;
-  box-shadow: 0 4px 18px rgba(0,0,0,.25);
-}
-.badge {
-  display:inline-block; padding:2px 8px; border-radius:999px;
-  background:#2a3038; border:1px solid #3a404a; font-size:.75rem;
+/* 全体のベース */
+:root{
+  --pp-red:#E53935;
+  --pp-red-weak:#fdeaea;
+  --pp-ink:#111;
+  --pp-muted:#6b7280;
+  --pp-card:#ffffff0f; /* darkでもほんのり面 */
 }
 
-/* nice buttons */
-.stButton>button {
-  border-radius: 10px !important;
-  border: 1px solid #3a404a !important;
-  padding: .6rem 1.1rem !important;
-  font-weight: 600 !important;
-}
-.stButton>button[kind="primary"] {
-  background: linear-gradient(180deg, var(--accent), #c83b3b) !important;
-  color: #fff !important;
-  border: none !important;
+/* ヘッダー風タイトル */
+.pp-header{
+  font-weight:800;
+  letter-spacing:.2px;
+  font-size:clamp(22px,3.2vw,30px);
+  margin: 4px 0 12px 0;
 }
 
-/* sidebar white base */
-[data-testid="stSidebar"] {
-  background: #f7f8fb !important;
-  border-right: 1px solid #e6e8ef;
+/* カード */
+.pp-card{
+  border-radius:14px;
+  border:1px solid #ffffff1a;
+  background: var(--pp-card);
+  padding:16px 18px;
+  box-shadow:0 6px 24px #00000014, 0 2px 8px #00000010;
 }
-[data-testid="stSidebar"] h2 { color: #182026 !important; }
-[data-testid="stSidebar"] .stSelectbox>div>div { background: #fff; }
 
-/* table */
-tbody tr:hover td { background: rgba(226,76,76,.06) !important; }
+/* プライマリボタン */
+.stButton>button{
+  background: var(--pp-red) !important;
+  border: 0 !important;
+  color: white !important;
+  font-weight: 700;
+  border-radius: 12px;
+}
+.stButton>button:hover{ filter:brightness(.95); }
+
+/* 任意のバッジ */
+.pp-badge{
+  display:inline-block;
+  padding:4px 10px;
+  border-radius:999px;
+  font-size:12px; font-weight:700;
+  background:var(--pp-red-weak);
+  color:var(--pp-ink);
+  border:1px solid #e5e7eb33;
+}
+
+/* option-menu の行間を少し詰める */
+div[role="tablist"] .nav-link{
+  padding:8px 14px !important;
+  border-radius:10px !important;
+}
 </style>
 """
-st.markdown(STYLES, unsafe_allow_html=True)
+st.markdown(_UI_CSS, unsafe_allow_html=True)
 
-# ====== Helpers ======
-def tz_now(conf):
-    tz = pytz.timezone(conf.get("timezone", "Asia/Tokyo"))
-    return datetime.now(tz)
+# -----------------------------
+# 共通ユーティリティ
+# -----------------------------
+@st.cache_data(ttl=30, show_spinner=False)
+def get_conf():
+    """config シート（key / value）を dict で取得"""
+    return read_config()
 
-def parse_users(conf):
-    """config.users_json を [{username,password,role,team}] へ"""
-    raw = conf.get("users_json", "").strip()
+def app_tz():
+    tzname = get_conf().get("timezone", "Asia/Tokyo")
+    try:
+        return pytz.timezone(tzname)
+    except Exception:
+        return pytz.timezone("Asia/Tokyo")
+
+def now_ts():
+    return datetime.now(tz=app_tz()).strftime("%Y-%m-%d %H:%M:%S")
+
+def parse_users():
+    raw = get_conf().get("users_json", "").strip()
     if not raw:
-        return []
+        # フォールバック（ゲストのみ）
+        return [{"username":"guest", "password":"guest", "role":"guest", "team":"Neutral"}]
     try:
         users = json.loads(raw)
-        assert isinstance(users, list)
         return users
-    except Exception as e:
-        st.error(f"ユーザー設定の読み込みに失敗しました: {e}")
-        return []
+    except Exception:
+        return [{"username":"guest", "password":"guest", "role":"guest", "team":"Neutral"}]
 
-def get_usernames(conf):
-    return [u["username"] for u in parse_users(conf)]
-
-def get_user(conf, username):
-    for u in parse_users(conf):
-        if u["username"] == username:
-            return u
-    return None
-
-# ====== Auth ======
-def show_login():
-    st.markdown("### Premier Picks")
-    st.caption("ログインしてください。")
-    conf = read_config()
-
-    users = parse_users(conf)
-    usernames = [u["username"] for u in users] or ["guest"]
-
-    c1, c2 = st.columns(2)
-    with c1:
-        username = st.selectbox("ユーザー", usernames, index=0, key="login_user")
-    with c2:
-        password = st.text_input("パスワード", type="password", key="login_pw")
-
-    colA, colB = st.columns([1,1])
-    with colA:
-        if st.button("ログイン", type="primary", use_container_width=True):
-            u = get_user(conf, username)
-            if u and (password == u.get("password", "")):
-                st.session_state["is_authenticated"] = True
-                st.session_state["username"] = username
-                st.session_state["role"] = u.get("role", "user")
-                st.rerun()
-            else:
-                st.error("ユーザー名またはパスワードが違います。")
-
-    with colB:
-        st.button("キャンセル", use_container_width=True)
-
-def logout_box():
-    u = st.session_state.get("username", "guest")
-    r = st.session_state.get("role", "user")
-    st.markdown(
-        f'<div class="card"><b>{u}</b> <span class="badge">{r}</span> '
-        f'<span class="badge">{read_config().get("current_gw","GW?")}</span> '
-        '</div>', unsafe_allow_html=True
-    )
-    if st.button("ログアウト", key="logout_btn"):
-        st.session_state.clear()
-        st.rerun()
-
-# ====== Navbar (radio) ======
-PAGES = {
-    "トップ": "home",
-    "試合とベット": "bet",
-    "履歴": "history",
-    "リアルタイム": "realtime",
-    "ルール": "rules",
-    "設定(管理者)": "settings",
-}
-def navbar():
-    st.sidebar.markdown("## メニュー")
-    page_key = st.sidebar.radio(
-        label="ページ",
-        options=list(PAGES.keys()),
-        label_visibility="collapsed",
-        index=0 if st.session_state.get("active_page") is None else list(PAGES.values()).index(st.session_state["active_page"]),
-    )
-    st.session_state["active_page"] = PAGES[page_key]
-
-# ====== Pages ======
-def page_home():
-    conf = read_config()
-    st.markdown("## ダッシュボード")
-    st.caption("直近のスケジュールと利用上限のサマリー")
-
-    # Fixtures
-    st.markdown("#### 直近の試合")
-    days = st.slider("何日先まで表示するか", 3, 14, 7)
-    ok, fixtures_or_msg = get_next_fixtures(days, conf)
-    if not ok:
-        st.warning(fixtures_or_msg)
-    else:
-        fixt = fixtures_or_msg
-        if not fixt:
-            st.info("対象期間の試合がありません。")
+def login_box():
+    st.write("### サインイン")
+    users = parse_users()
+    usernames = [u["username"] for u in users]
+    u = st.selectbox("ユーザーを選択", usernames, index=0)
+    p = st.text_input("パスワード", type="password")
+    col1, col2 = st.columns([1,1])
+    login_clicked = col1.button("ログイン")
+    if login_clicked:
+        user = next((x for x in users if x["username"] == u and x.get("password") == p), None)
+        if user:
+            st.session_state["user"] = user
+            st.success("ログインしました。")
+            st.rerun()
         else:
-            for f in fixt:
-                st.markdown(
-                    f'<div class="card">'
-                    f'<b>{f["home"]}</b> vs <b>{f["away"]}</b>　'
-                    f'<span class="badge">{f["kickoff_local"]}</span> '
-                    f'<span class="badge">GW {f.get("matchday","?")}</span>'
-                    f'</div>', unsafe_allow_html=True
-                )
+            st.error("ユーザー名またはパスワードが正しくありません。")
 
-    # KPI
-    st.markdown("#### 残高と利用上限（仮）")
-    bets = read_bets()
-    user = st.session_state.get("username","guest")
-    my = [b for b in bets if b.get("user")==user]
-    total_stake = sum(int(b.get("stake",0) or 0) for b in my)
-    st.write(f"今節のベット合計: **{total_stake}** 円 / 上限 **{conf.get('max_total_stake_per_gw','?')}** 円")
-    st.progress(min(1.0, total_stake/max(1,int(conf.get('max_total_stake_per_gw',5000)))))
-
-def page_bet():
-    conf = read_config()
-    st.markdown("## 試合とベット")
-    logout_box()
-
-    username = st.session_state.get("username", "guest")
-    bookmaker = conf.get("bookmaker_username","")
-    if username == bookmaker:
-        st.info(f"今節は **{bookmaker}** がブックメーカー役のため、ベッティングできません。")
-        return
-
-    # Fixtures
-    lock_min = int(conf.get("lock_minutes_before_earliest", 120))
-    ok, fixtures_or_msg = get_next_fixtures(7, conf)
-    if not ok:
-        st.warning(fixtures_or_msg)
-        return
-    fixtures = fixtures_or_msg
-
-    if not fixtures:
-        st.info("対象期間の試合がありません。")
-        return
-
-    # 最も早いKOの lock 時刻
-    earliest = min([f["kickoff_dt"] for f in fixtures])
-    lock_at = earliest - timedelta(minutes=lock_min)
-    now = tz_now(conf)
-    locked = now >= lock_at
-    st.caption(f"ロック時刻: {lock_at.strftime('%Y-%m-%d %H:%M')}　（現在: {now.strftime('%H:%M')}）")
-    if locked:
-        st.warning("現在ロック中のため、ベットはできません。")
-        return
-
-    # 入力UI
-    picks = []
-    for i, f in enumerate(fixtures):
-        with st.expander(f'{f["kickoff_local"]} ｜ GW{f.get("matchday","?")} ｜ {f["home"]} vs {f["away"]}', expanded=False):
-            col1, col2, col3 = st.columns([1.2,1,1])
-            with col1:
-                bet_team = st.selectbox("賭け先", [f["home"], "Draw", f["away"]],
-                                        key=f"bt_{i}")
-            with col2:
-                odds = st.number_input("オッズ", value=float(f.get("odds", 1.9)), step=0.01,
-                                       key=f"od_{i}")
-            with col3:
-                step = int(conf.get("stake_step", 100))
-                stake = st.number_input("掛金(円)", value=step, step=step, min_value=0,
-                                        key=f"st_{i}")
-            picks.append({"match": f'{f["home"]} vs {f["away"]}',
-                          "bet_team": bet_team, "odds": odds, "stake": stake})
-
-    # 送信
-    if st.button("保存（各試合を1行で記録）", type="primary", use_container_width=True):
-        for p in picks:
-            if p["stake"] and p["stake"]>0:
-                upsert_bet_row(
-                    gw=conf.get("current_gw","GW?"),
-                    match=p["match"],
-                    user=username,
-                    bet_team=p["bet_team"],
-                    stake=int(p["stake"]),
-                    odds=float(p["odds"]),
-                    ts=tz_now(conf).strftime("%Y-%m-%d %H:%M:%S"),
-                )
-        st.success("保存しました。")
+def user_badge():
+    u = st.session_state.get("user")
+    if not u: return
+    st.markdown(
+        f"**{u['username']}**　"
+        f"<span class='pp-badge'>{u.get('role','guest')}</span> 　"
+        f"<span class='pp-badge'>Team: {u.get('team','-')}</span>",
+        unsafe_allow_html=True
+    )
+    if st.button("ログアウト", use_container_width=True):
+        for k in ["user"]:
+            st.session_state.pop(k, None)
         st.rerun()
 
-def page_history():
-    st.markdown("## 履歴")
-    logout_box()
-    bets = read_bets()
-    if not bets:
-        st.info("まだ記録がありません。")
-        return
-    # 並べ替え
-    bets = sorted(bets, key=lambda x: x.get("timestamp",""))
-    st.dataframe(bets, use_container_width=True, hide_index=True)
+# -----------------------------
+# ページ描画（各ビュー）
+# -----------------------------
+def view_home():
+    st.markdown("<div class='pp-header'>🏠 トップ</div>", unsafe_allow_html=True)
+    conf = get_conf()
+    gw = conf.get("current_gw", "-")
+    st.info(f"現在のゲームウィーク: **{gw}**")
+    with st.container():
+        col1, col2 = st.columns([1,1])
+        with col1:
+            st.markdown("#### 今週のルール要点")
+            st.markdown("- ブックメーカー役はベット不可\n- キックオフ2時間前でロック\n- 100円刻みでベット可能")
+        with col2:
+            st.markdown("#### あなたのステータス")
+            u = st.session_state.get("user", {})
+            st.write(f"- ユーザー: **{u.get('username','-')}**")
+            st.write(f"- ロール: **{u.get('role','-')}**")
+            st.write(f"- 推し: **{u.get('team','-')}**")
 
-def page_realtime():
-    st.markdown("## リアルタイム")
-    logout_box()
-    st.info("（デモ）ここに速報スコア×ベット金額のリアルタイム損益を出します。")
+def view_bets():
+    from pages.bets_view import render as render_bets
+    render_bets()
 
-def page_rules():
-    st.markdown("## ルール")
-    st.markdown("""
-- 1GWあたりの上限は **config.max_total_stake_per_gw** 円  
-- 最も早いキックオフの **config.lock_minutes_before_earliest** 分前にロック  
-- ブックメーカー役（**config.bookmaker_username**）はベット不可
-""")
+def view_history():
+    from pages.history_view import render as render_history
+    render_history()
 
-def page_settings():
-    st.markdown("## 設定（管理者）")
-    logout_box()
-    if st.session_state.get("role") != "admin":
-        st.warning("管理者のみアクセスできます。")
-        return
-    conf = read_config()
-    st.json(conf)
+def view_realtime():
+    from pages.realtime_view import render as render_realtime
+    render_realtime()
 
-# ====== Router ======
-def router():
-    page = st.session_state.get("active_page", "home")
-    if page == "home": page_home()
-    elif page == "bet": page_bet()
-    elif page == "history": page_history()
-    elif page == "realtime": page_realtime()
-    elif page == "rules": page_rules()
-    elif page == "settings": page_settings()
+def view_rules():
+    from pages.rules_view import render as render_rules
+    render_rules()
 
-# ====== App entry ======
-def main():
-    navbar()
-    if st.session_state.get("is_authenticated"):
-        router()
+def view_settings():
+    from pages.settings_view import render as render_settings
+    render_settings()
+
+# -----------------------------
+# サイドバー：ログイン専用
+# -----------------------------
+with st.sidebar:
+    st.markdown("### アカウント")
+    if "user" not in st.session_state:
+        login_box()
     else:
-        show_login()
+        user_badge()
 
-if __name__ == "__main__":
-    main()
+# -----------------------------
+# ナビゲーション（option-menu）
+# -----------------------------
+user = st.session_state.get("user", {"role": "guest"})
+is_admin = user.get("role") == "admin"
+
+labels = ["トップ", "試合とベット", "履歴", "リアルタイム", "ルール"]
+icons  = ["house", "bullseye", "clock-history", "stopwatch", "book"]
+if is_admin:
+    labels.append("設定")
+    icons.append("gear")
+
+choice = option_menu(
+    None,
+    labels,
+    icons=icons,
+    default_index=0,
+    orientation="horizontal",
+    styles={
+        "container": {"padding": "6px 0px 0px 0px"},
+        "icon": {"color": "#E53935", "font-size": "18px"},
+        "nav-link": {"--hover-color": "#fdeaea"},
+        "nav-link-selected": {"background-color": "#fdeaea", "color": "#111"}
+    }
+)
+
+# -----------------------------
+# ルーティング
+# -----------------------------
+if choice == "トップ":
+    view_home()
+elif choice == "試合とベット":
+    view_bets()
+elif choice == "履歴":
+    view_history()
+elif choice == "リアルタイム":
+    view_realtime()
+elif choice == "ルール":
+    view_rules()
+elif choice == "設定" and is_admin:
+    view_settings()
