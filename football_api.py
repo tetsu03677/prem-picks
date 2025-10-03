@@ -1,68 +1,61 @@
-# football_api.py —— 差し替え版
+# football_api.py
 from __future__ import annotations
-import datetime as dt
+import os
 import requests
-from typing import Dict, Any, List
-import streamlit as st
+from datetime import datetime, timedelta, timezone
 
-def _fd_headers(token: str) -> Dict[str, str]:
-    return {"X-Auth-Token": token}
+TZ_UTC = timezone.utc
+FD_BASE = "https://api.football-data.org/v4"
 
-def _competition_value(conf: Dict[str, str]) -> str:
+def _headers_fd(api_token: str):
+    return {"X-Auth-Token": api_token}
+
+def _iso_to_dt(s: str) -> datetime:
+    # football-data は ISO8601（末尾Z）なので UTC として解釈
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(TZ_UTC)
+
+def fetch_next_round_fd(api_token: str, league_id: str | int, season: str | int):
     """
-    configの値を安全に正規化。
-    - 'PL' や '39' が来ても Premier League の ID '2021' に寄せる
-    - 未設定なら '2021'
+    次に来るラウンド（matchday=GW）をまとめて返す。
+    - まず今から+30日までのSCHEDULEDを取得
+    - 最も早い試合の matchday を次節とみなし、その matchday の試合を全部返す
     """
-    raw = (conf.get("FOOTBALL_DATA_COMPETITION") or "").strip().upper()
-    if raw in ("", "PL", "39", "2021"):
-        return "2021"   # Premier League ID
-    return raw
-
-def fetch_fixtures_fd(conf: Dict[str, str], days_ahead: int) -> Dict[str, Any]:
-    token = conf.get("FOOTBALL_DATA_API_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("FOOTBALL_DATA_API_TOKEN が未設定です。（config シート）")
-
-    comp = _competition_value(conf)
-
-    # 未来日を取りすぎると 400 のことがあるので最大 21 日でクリップ
-    days = max(1, min(int(days_ahead), 21))
-    today = dt.datetime.utcnow().date()
+    url = f"{FD_BASE}/competitions/{league_id}/matches"
+    # 余裕をもって30日先まで取得してから「次のGW」を切り出す
+    today = datetime.now(TZ_UTC).date()
     params = {
+        "season": str(season),
         "dateFrom": today.isoformat(),
-        "dateTo":   (today + dt.timedelta(days=days)).isoformat(),
-        "competitions": comp,
-        # データが出やすいようにステータスも明示
-        "status": "SCHEDULED,IN_PLAY,PAUSED,FINISHED,POSTPONED",
+        "dateTo": (today + timedelta(days=30)).isoformat(),
+        "status": "SCHEDULED",
     }
+    r = requests.get(url, headers=_headers_fd(api_token), params=params, timeout=20)
+    r.raise_for_status()
+    data = r.json()
 
-    url = "https://api.football-data.org/v4/matches"
-    r = requests.get(url, headers=_fd_headers(token), params=params, timeout=20)
-    # 失敗時はサーバーからのエラー本文を出す（デバッグしやすく）
-    try:
-        r.raise_for_status()
-    except requests.HTTPError as e:
-        detail = ""
-        try:
-            detail = r.json().get("message", "")
-        except Exception:
-            detail = r.text[:200]
-        raise requests.HTTPError(f"{e} :: {detail}") from None
+    matches = data.get("matches", [])
+    if not matches:
+        return {"fixtures": [], "earliest_utc": None, "matchday": None}
 
-    return r.json()
+    # 一番早い試合を探す
+    matches_sorted = sorted(matches, key=lambda m: _iso_to_dt(m["utcDate"]))
+    first = matches_sorted[0]
+    next_md = first.get("matchday") or first.get("season", {}).get("currentMatchday")
+    # 同じ matchday の試合をまとめる
+    gw_fixtures = [m for m in matches_sorted if m.get("matchday") == next_md]
 
-def simplify_matches(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
-    out = []
-    for m in raw.get("matches", []):
-        out.append({
-            "id": m.get("id"),
-            "utc": m.get("utcDate"),
-            "status": m.get("status"),
-            "home": m.get("homeTeam", {}).get("name"),
-            "away": m.get("awayTeam", {}).get("name"),
-            "score": m.get("score", {}),
-            "stage": m.get("stage"),
+    fixtures = []
+    for m in gw_fixtures:
+        fixtures.append({
+            "match_id": m["id"],
+            "home": m["homeTeam"]["name"],
+            "away": m["awayTeam"]["name"],
+            "utc": _iso_to_dt(m["utcDate"]).isoformat(),
             "matchday": m.get("matchday"),
         })
-    return out
+
+    return {
+        "fixtures": fixtures,
+        "earliest_utc": _iso_to_dt(first["utcDate"]),
+        "matchday": next_md,
+    }
