@@ -1,54 +1,64 @@
-from __future__ import annotations
-
-import datetime as dt
-from typing import Dict, Any, List, Tuple
-
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Any, Tuple
 import requests
-from dateutil.tz import gettz
+import pytz
 
-BASE = "https://api.football-data.org/v4"
+FD_BASE = "https://api.football-data.org/v4"
 
-def _hdr(token: str) -> Dict[str, str]:
-    return {"X-Auth-Token": token}
+def _tz(tz_name: str):
+    try:
+        return pytz.timezone(tz_name)
+    except Exception:
+        return timezone.utc
 
-def _iso(d: dt.date) -> str:
-    return d.isoformat()
+def _iso(d: datetime) -> str:
+    return d.strftime("%Y-%m-%d")
 
-def fetch_matches_next_window(days: int, competition: str, season: str, token: str) -> Tuple[List[Dict[str, Any]], str]:
+def fetch_matches_window(days_ahead: int, competition: str, season: str, token: str, tz_name: str) -> Tuple[List[Dict[str, Any]], str]:
     """
-    次の 'days' 日間の SCHEDULED 試合を取得（competition は 'PL' 等のコード or 数値ID どちらでも可）
+    Return upcoming matches within next `days_ahead` days for competition.
+    Each match dict: id, gw, utc_kickoff, local_kickoff, home, away, status.
+    GWは API の matchday があれば GW{n}、なければ season の current_gw を使う想定で、空なら "GW?"。
     """
-    start = dt.date.today()
-    end = start + dt.timedelta(days=days)
-    params = {
-        "dateFrom": _iso(start),
-        "dateTo": _iso(end),
-        "season": season,
-        "status": "SCHEDULED",
-    }
-    url = f"{BASE}/competitions/{competition}/matches"
-    r = requests.get(url, headers=_hdr(token), params=params, timeout=20)
-    if r.status_code == 404:
-        return [], "no_window"
+    now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+    date_from = _iso(now_utc)
+    date_to = _iso(now_utc + timedelta(days=days_ahead))
+
+    url = f"{FD_BASE}/competitions/{competition}/matches"
+    params = {"dateFrom": date_from, "dateTo": date_to, "season": season}
+    headers = {"X-Auth-Token": token}
+    r = requests.get(url, params=params, headers=headers, timeout=30)
     r.raise_for_status()
     data = r.json()
-    return data.get("matches", []), "ok"
 
-def simplify_matches(raw: List[Dict[str, Any]], tz_name: str) -> List[Dict[str, Any]]:
-    tz = gettz(tz_name) or gettz("UTC")
-    out: List[Dict[str, Any]] = []
-    for m in raw:
-        utc_str = m.get("utcDate") or m.get("utc_date")
-        kf_utc = dt.datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
-        kf_local = kf_utc.astimezone(tz)
-        out.append({
-            "id": str(m["id"]),
-            "gw": f"GW{m.get('matchday') or m.get('matchDay') or '?'}",
-            "utc_kickoff": kf_utc,
-            "local_kickoff": kf_local,
-            "home": m["homeTeam"]["name"],
-            "away": m["awayTeam"]["name"],
-            "status": m.get("status", ""),
+    results = []
+    gw_label = None
+    for m in (data.get("matches") or []):
+        mid = str(m.get("id"))
+        status = m.get("status")
+        utc_iso = m.get("utcDate")
+        try:
+            utc_dt = datetime.fromisoformat(utc_iso.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        home = (m.get("homeTeam") or {}).get("name")
+        away = (m.get("awayTeam") or {}).get("name")
+        matchday = m.get("matchday")
+        gw = f"GW{matchday}" if matchday else "GW?"
+        if gw_label is None:
+            gw_label = gw
+
+        local = utc_dt.astimezone(_tz(tz_name))
+        results.append({
+            "id": mid,
+            "gw": gw,
+            "utc_kickoff": utc_dt,
+            "local_kickoff": local,
+            "home": home,
+            "away": away,
+            "status": status,
         })
-    out.sort(key=lambda x: x["utc_kickoff"])
-    return out
+
+    # sort
+    results.sort(key=lambda x: x["utc_kickoff"])
+    return results, (gw_label or "GW?")
