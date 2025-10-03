@@ -33,7 +33,7 @@ def read_config() -> Dict[str, str]:
             conf[k] = v
     return conf
 
-# ── odds を指定GWで {match_id: {...}} に整形して返す ───────────────
+# ── odds（指定GW）: {match_id: {...}} ───────────────────────────
 @st.cache_data(ttl=30, show_spinner=False)
 def read_odds_map_for_gw(gw: int) -> Dict[str, Dict[str, Any]]:
     sheet = ws("odds")
@@ -54,7 +54,7 @@ def read_odds_map_for_gw(gw: int) -> Dict[str, Dict[str, Any]]:
         }
     return odmap
 
-# ── 指定GWの自分の合計ステーク ────────────────────────────────
+# ── 自分の合計ステーク（指定GW） ───────────────────────────────
 @st.cache_data(ttl=10, show_spinner=False)
 def user_total_stake_for_gw(user: str, gw: int) -> int:
     sheet = ws("bets")
@@ -68,12 +68,10 @@ def user_total_stake_for_gw(user: str, gw: int) -> int:
                 pass
     return total
 
-# ── その試合に対する自分のベットを取得（行番号つき） ──────────────
+# ── その試合の自分ベット取得（行番号つき） ───────────────────────
 def get_user_bet_for_match(user: str, gw: int, match_id: str) -> Optional[Tuple[int, Dict[str, Any]]]:
-    """見出し行を1としてカウント。返り値: (row_number, row_dict) か None"""
     sheet = ws("bets")
     rows = sheet.get_all_records()
-    # get_all_records は2行目からが最初のデータ。行番号=index+2
     for idx, r in enumerate(rows):
         if (
             str(r.get("gw", "")) == str(gw)
@@ -81,10 +79,25 @@ def get_user_bet_for_match(user: str, gw: int, match_id: str) -> Optional[Tuple[
             and str(r.get("match_id", "")) == str(match_id)
             and str(r.get("status", "OPEN")).upper() == "OPEN"
         ):
-            return idx + 2, r
+            return idx + 2, r  # 行番号（ヘッダが1行目）
     return None
 
-# ── 追記（新規ベット） ───────────────────────────────────────
+# ── 試合別：他ユーザーのOPENベット一覧（自分含む） ───────────────
+@st.cache_data(ttl=10, show_spinner=False)
+def open_bets_for_match(gw: int, match_id: str) -> List[Dict[str, Any]]:
+    sheet = ws("bets")
+    rows = sheet.get_all_records()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        if (
+            str(r.get("gw", "")) == str(gw)
+            and str(r.get("match_id", "")) == str(match_id)
+            and str(r.get("status", "OPEN")).upper() == "OPEN"
+        ):
+            out.append(r)
+    return out
+
+# ── 新規追記 ────────────────────────────────────────────────────
 def append_bet_row(
     gw: int,
     user: str,
@@ -97,8 +110,6 @@ def append_bet_row(
     sheet = ws("bets")
     now_utc = datetime.now(UTC).isoformat()
     key = f"{gw}-{user}-{match_id}-{int(datetime.now().timestamp())}"
-
-    # 列: key, gw, user, match_id, match, pick, stake, odds, placed_at, status, result, payout, net, settled_at
     row = [
         key, gw, user, match_id, match_label, pick, stake, odds,
         now_utc, "OPEN", "", "", "", ""
@@ -106,7 +117,7 @@ def append_bet_row(
     sheet.append_row(row, value_input_option="USER_ENTERED")
     user_total_stake_for_gw.clear()
 
-# ── 更新（既存があれば上書き、なければ追記） ────────────────────
+# ── upsert（既存があれば上書き） ───────────────────────────────
 def upsert_bet_row(
     gw: int,
     user: str,
@@ -128,9 +139,9 @@ def upsert_bet_row(
             now_utc, r.get("status","OPEN"), r.get("result",""),
             r.get("payout",""), r.get("net",""), r.get("settled_at","")
         ]
-        # A〜N の14列を丸ごと更新
         sheet.update(f"A{row_no}:N{row_no}", [values], value_input_option="USER_ENTERED")
     else:
         append_bet_row(gw, user, match_id, match_label, pick, stake, odds)
 
     user_total_stake_for_gw.clear()
+    open_bets_for_match.clear()
