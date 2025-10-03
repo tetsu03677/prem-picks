@@ -10,14 +10,15 @@ from google_sheets_client import (
     read_config,
     read_odds_map_for_gw,
     user_total_stake_for_gw,
-    append_bet_row,
+    get_user_bet_for_match,
+    upsert_bet_row,
 )
 from football_api import fetch_next_round_fd
 
 st.set_page_config(page_title="Premier Picks", page_icon="⚽", layout="wide")
 TZ_UTC = timezone.utc
 
-# ちょい美化CSS（チーム名大きめ、ホーム太字）
+# ── ちょい美化CSS ──────────────────────────────────────────────
 st.markdown(
     """
     <style>
@@ -26,6 +27,7 @@ st.markdown(
     .match-odds   {font-size: 0.95rem;}
     .subtle {opacity: 0.7;}
     .small  {font-size:0.85rem;}
+    .capline {margin-top:-8px; margin-bottom:18px;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -79,7 +81,6 @@ def render_home():
     st.write(f"ようこそ **{u['username']}** さん！")
 
 def _is_globally_locked(conf: dict, earliest_utc: datetime) -> bool:
-    """最初のキックオフ X 分前でベットをロック"""
     try:
         freeze_min = int(conf.get("odds_freeze_minutes_before_first", conf.get("lock_minutes_before_earliest", "120")))
     except Exception:
@@ -100,7 +101,7 @@ def render_matches_and_bets():
         st.error("FOOTBALL_DATA_API_TOKEN が未設定です")
         return
 
-    # football-data.org から“次のGW”を取得（7日以内ルール）
+    # 次のGW（7日以内ルール）
     with st.spinner("試合データ取得中…"):
         resp = fetch_next_round_fd(api_token, competition, season)
     fixtures = resp.get("fixtures") or []
@@ -111,13 +112,12 @@ def render_matches_and_bets():
         st.info("予定された試合が見つかりません。")
         return
 
-    # 7日以内でなければ告知して終了
     if (first_utc - datetime.now(TZ_UTC)) > timedelta(days=7):
         first_local = _localize(first_utc, tzname)
         st.warning(f"7日以内に次のGWはありません。次のGW({gw})の最初のキックオフ: {first_local:%m/%d %H:%M}")
         return
 
-    # オッズ（なければ1.0 仮置き）
+    # オッズ（未入力は 1.0 仮置き）
     odds_map = read_odds_map_for_gw(int(gw))
     globally_locked = _is_globally_locked(conf, first_utc)
 
@@ -135,7 +135,7 @@ def render_matches_and_bets():
     placed_total = user_total_stake_for_gw(user, int(gw))
     remaining = max(0, max_total - placed_total)
 
-    st.caption(f"このGWのあなたの投票合計: **{placed_total}** / 上限 **{max_total}**（残り **{remaining}**）")
+    st.caption(f"このGWのあなたの投票合計: **{placed_total}** / 上限 **{max_total}**（残り **{remaining}**）", help="同一試合は上書き更新できます。")
 
     st.subheader(f"試合一覧（GW{gw}）")
     for m in fixtures:
@@ -146,6 +146,15 @@ def render_matches_and_bets():
         od = odds_map.get(match_id, {"home": 1.0, "draw": 1.0, "away": 1.0, "locked": False})
         placeholder = (od["home"] == 1.0 and od["draw"] == 1.0 and od["away"] == 1.0)
         match_locked = od.get("locked", False) or globally_locked
+
+        # 既存ベット（自分）
+        mine = get_user_bet_for_match(user, int(gw), match_id)
+        existing_stake = 0
+        existing_pick = None
+        if mine:
+            _, r = mine
+            existing_stake = int(float(r.get("stake", 0) or 0))
+            existing_pick = str(r.get("pick","")).upper()
 
         with st.container(border=True):
             # ヘッダ行
@@ -174,33 +183,48 @@ def render_matches_and_bets():
             if placeholder:
                 st.info("オッズ未入力のため仮オッズ（=1.0）を表示中。管理者は『オッズ管理』で設定してください。")
 
-            # 入力UI
-            pick = st.radio(
-                "ピック", 
-                [f"HOME（{home}）", "DRAW", f"AWAY（{away}）"],
+            # 入力UI（Home Win / Draw / Away Win）
+            options = [f"Home Win（{home}）", "Draw", f"Away Win（{away}）"]
+            # 既存ピック → デフォルト選択
+            if   existing_pick == "HOME": default_idx = 0
+            elif existing_pick == "DRAW": default_idx = 1
+            elif existing_pick == "AWAY": default_idx = 2
+            else:                         default_idx = 0
+
+            pick_label = st.radio(
+                "ピック",
+                options,
                 horizontal=True,
+                index=default_idx,
                 key=f"pick-{match_id}",
             )
-            # 残額に合わせた上限
-            max_stake_for_card = remaining if remaining > 0 else 0
+
+            # 上限（既存分は差し戻し可能）
+            cap = max(0, max_total - placed_total + existing_stake)
+            stake_val = existing_stake if existing_stake > 0 else 0
             stake = st.number_input(
-                "ステーク", min_value=0, max_value=max_stake_for_card,
-                step=step, key=f"stake-{match_id}",
-                help=f"このカードで使える上限: {max_stake_for_card}"
+                "ステーク",
+                min_value=0,
+                max_value=cap,
+                step=step,
+                value=stake_val,
+                key=f"stake-{match_id}",
+                help=f"このカードで使える上限: {cap}（既存ベット分 {existing_stake} を含む）"
             )
 
-            btn_disabled = match_locked or stake <= 0 or max_stake_for_card <= 0
-            if st.button("この内容でベット", key=f"bet-{match_id}", disabled=btn_disabled):
+            btn_disabled = match_locked or stake <= 0 or cap <= 0
+            action_label = "ベットを更新" if mine else "この内容でベット"
+            if st.button(action_label, key=f"bet-{match_id}", disabled=btn_disabled):
                 # ピックとオッズを紐付け
-                if pick.startswith("HOME"):
+                if pick_label.startswith("Home"):
                     pkey, o = "HOME", float(od["home"])
-                elif pick == "DRAW":
+                elif pick_label.startswith("Draw"):
                     pkey, o = "DRAW", float(od["draw"])
                 else:
                     pkey, o = "AWAY", float(od["away"])
 
                 try:
-                    append_bet_row(
+                    upsert_bet_row(
                         gw=int(gw),
                         user=user,
                         match_id=match_id,
@@ -210,8 +234,7 @@ def render_matches_and_bets():
                         odds=o,
                     )
                     st.success("ベットを記録しました！")
-                    # 画面上の残額を即時更新
-                    st.experimental_rerun()
+                    st.rerun()
                 except Exception as e:
                     st.error(f"書き込みに失敗しました: {e}")
 
