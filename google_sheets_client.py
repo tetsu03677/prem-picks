@@ -1,17 +1,14 @@
-# google_sheets_client.py
-from __future__ import annotations
-from typing import Dict, List, Any, Optional, Tuple
+import json
+from typing import Dict, List, Tuple, Optional
 from datetime import datetime, timezone
 import streamlit as st
 import gspread
 
-UTC = timezone.utc
-
-# ── 接続 ─────────────────────────────────────────────────────────
+# ===== 基本接続 =====
 @st.cache_resource(show_spinner=False)
 def _gc():
-    creds_dict = st.secrets["gcp_service_account"]
-    return gspread.service_account_from_dict(creds_dict)
+    creds = st.secrets["gcp_service_account"]
+    return gspread.service_account_from_dict(creds)
 
 @st.cache_resource(show_spinner=False)
 def _sh():
@@ -21,127 +18,139 @@ def _sh():
 def ws(name: str):
     return _sh().worksheet(name)
 
-# ── config の key-value を dict で取得 ──────────────────────────
+# ===== config 読み込み =====
 @st.cache_data(ttl=60, show_spinner=False)
 def read_config() -> Dict[str, str]:
     data = ws("config").get_all_records()
-    conf: Dict[str, str] = {}
-    for row in data:
-        k = str(row.get("key", "")).strip()
-        v = str(row.get("value", "")).strip()
+    conf = {}
+    for r in data:
+        k = str(r.get("key", "")).strip()
+        v = r.get("value", "")
         if k:
-            conf[k] = v
+            conf[k] = str(v)
     return conf
 
-# ── odds（指定GW）: {match_id: {...}} ───────────────────────────
+# ===== odds 読み書き =====
 @st.cache_data(ttl=30, show_spinner=False)
-def read_odds_map_for_gw(gw: int) -> Dict[str, Dict[str, Any]]:
-    sheet = ws("odds")
-    rows = sheet.get_all_records()
-    odmap: Dict[str, Dict[str, Any]] = {}
+def read_odds() -> Dict[str, Dict]:
+    rows = ws("odds").get_all_records()
+    by_mid = {}
     for r in rows:
-        if str(r.get("gw", "")).strip() != str(gw):
-            continue
         mid = str(r.get("match_id", "")).strip()
         if not mid:
             continue
-        odmap[mid] = {
-            "home": float(r.get("home_win", 0) or 0),
+        by_mid[mid] = {
+            "gw": str(r.get("gw", "")).strip(),
+            "home": str(r.get("home", "")).strip(),
+            "away": str(r.get("away", "")).strip(),
+            "home_win": float(r.get("home_win", 0) or 0),
             "draw": float(r.get("draw", 0) or 0),
-            "away": float(r.get("away_win", 0) or 0),
-            "locked": bool(r.get("locked", False)),
-            "updated_at": r.get("updated_at", ""),
+            "away_win": float(r.get("away_win", 0) or 0),
+            "locked": str(r.get("locked", "")).strip().upper() in ("1","TRUE","YES"),
+            "updated_at": str(r.get("updated_at","")).strip()
         }
-    return odmap
+    return by_mid
 
-# ── 自分の合計ステーク（指定GW） ───────────────────────────────
-@st.cache_data(ttl=10, show_spinner=False)
-def user_total_stake_for_gw(user: str, gw: int) -> int:
-    sheet = ws("bets")
-    rows = sheet.get_all_records()
+def upsert_odds_row(gw: str, match_id: str, home: str, away: str,
+                    home_win: float, draw: float, away_win: float, locked: bool):
+    w = ws("odds")
+    vals = w.get_all_values()
+    header = vals[0] if vals else []
+    idx_map = {h:i for i,h in enumerate(header)}
+    def row_to_key(row):
+        return str(row[idx_map["match_id"]]) if "match_id" in idx_map else ""
+
+    # 既存検索
+    target_row = None
+    for i,row in enumerate(vals[1:], start=2):
+        if row_to_key(row) == str(match_id):
+            target_row = i
+            break
+
+    payload = {
+        "gw": gw, "match_id": match_id, "home": home, "away": away,
+        "home_win": home_win, "draw": draw, "away_win": away_win,
+        "locked": "1" if locked else "", "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    # ヘッダ順に並べた行へ
+    out = []
+    for h in header:
+        out.append(str(payload.get(h,"")))
+
+    if target_row:
+        w.update(f"A{target_row}:{gspread.utils.rowcol_to_a1(target_row, len(header))}", [out])
+    else:
+        # 無い場合は行追加
+        w.append_row(out, value_input_option="USER_ENTERED")
+
+    # キャッシュクリア
+    read_odds.clear()
+
+# ===== bets 読み書き =====
+@st.cache_data(ttl=20, show_spinner=False)
+def read_bets() -> List[Dict]:
+    return ws("bets").get_all_records()
+
+def _bet_key(gw: str, user: str, match_id: str) -> str:
+    return f"{gw}__{user}__{match_id}"
+
+def upsert_bet(gw: str, user: str, match_id: str, match_label: str,
+               pick: str, stake: int, odds: float, status: str = "placed"):
+    w = ws("bets")
+    vals = w.get_all_values()
+    header = vals[0]
+    idx = {h:i for i,h in enumerate(header)}
+
+    # 既存検索
+    key = _bet_key(gw, user, match_id)
+    found_row = None
+    for i,row in enumerate(vals[1:], start=2):
+        if idx.get("key") is not None and row[idx["key"]] == key:
+            found_row = i
+            break
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    record = {
+        "key": key,
+        "gw": gw,
+        "user": user,
+        "match_id": match_id,
+        "match": match_label,
+        "pick": pick,
+        "stake": stake,
+        "odds": odds,
+        "placed_at": now_iso,
+        "status": status,
+        "result": "",
+        "payout": "",
+        "net": "",
+        "settled_at": ""
+    }
+    row_out = [str(record.get(h,"")) for h in header]
+
+    if found_row:
+        w.update(f"A{found_row}:{gspread.utils.rowcol_to_a1(found_row, len(header))}", [row_out])
+    else:
+        w.append_row(row_out, value_input_option="USER_ENTERED")
+
+    read_bets.clear()
+
+def user_total_stake_in_gw(user: str, gw: str) -> int:
     total = 0
-    for r in rows:
-        if str(r.get("gw", "")) == str(gw) and str(r.get("user", "")) == user:
-            try:
-                total += int(float(r.get("stake", 0) or 0))
-            except Exception:
-                pass
+    for r in read_bets():
+        if str(r.get("gw")) == gw and str(r.get("user")) == user:
+            total += int(float(r.get("stake") or 0))
     return total
 
-# ── その試合の自分ベット取得（行番号つき） ───────────────────────
-def get_user_bet_for_match(user: str, gw: int, match_id: str) -> Optional[Tuple[int, Dict[str, Any]]]:
-    sheet = ws("bets")
-    rows = sheet.get_all_records()
-    for idx, r in enumerate(rows):
-        if (
-            str(r.get("gw", "")) == str(gw)
-            and str(r.get("user", "")) == user
-            and str(r.get("match_id", "")) == str(match_id)
-            and str(r.get("status", "OPEN")).upper() == "OPEN"
-        ):
-            return idx + 2, r  # 行番号（ヘッダが1行目）
-    return None
-
-# ── 試合別：他ユーザーのOPENベット一覧（自分含む） ───────────────
-@st.cache_data(ttl=10, show_spinner=False)
-def open_bets_for_match(gw: int, match_id: str) -> List[Dict[str, Any]]:
-    sheet = ws("bets")
-    rows = sheet.get_all_records()
-    out: List[Dict[str, Any]] = []
-    for r in rows:
-        if (
-            str(r.get("gw", "")) == str(gw)
-            and str(r.get("match_id", "")) == str(match_id)
-            and str(r.get("status", "OPEN")).upper() == "OPEN"
-        ):
-            out.append(r)
+def other_bets_for_match(match_id: str, exclude_user: str) -> List[Dict]:
+    out = []
+    for r in read_bets():
+        if str(r.get("match_id")) == str(match_id) and str(r.get("user")) != exclude_user:
+            out.append({
+                "user": r.get("user"),
+                "pick": r.get("pick"),
+                "stake": r.get("stake"),
+                "odds": r.get("odds")
+            })
     return out
-
-# ── 新規追記 ────────────────────────────────────────────────────
-def append_bet_row(
-    gw: int,
-    user: str,
-    match_id: str,
-    match_label: str,
-    pick: str,          # "HOME" / "DRAW" / "AWAY"
-    stake: int,
-    odds: float,
-) -> None:
-    sheet = ws("bets")
-    now_utc = datetime.now(UTC).isoformat()
-    key = f"{gw}-{user}-{match_id}-{int(datetime.now().timestamp())}"
-    row = [
-        key, gw, user, match_id, match_label, pick, stake, odds,
-        now_utc, "OPEN", "", "", "", ""
-    ]
-    sheet.append_row(row, value_input_option="USER_ENTERED")
-    user_total_stake_for_gw.clear()
-
-# ── upsert（既存があれば上書き） ───────────────────────────────
-def upsert_bet_row(
-    gw: int,
-    user: str,
-    match_id: str,
-    match_label: str,
-    pick: str,      # "HOME"/"DRAW"/"AWAY"
-    stake: int,
-    odds: float,
-) -> None:
-    sheet = ws("bets")
-    found = get_user_bet_for_match(user, gw, match_id)
-    now_utc = datetime.now(UTC).isoformat()
-
-    if found:
-        row_no, r = found
-        key = r.get("key", f"{gw}-{user}-{match_id}")
-        values = [
-            key, gw, user, match_id, match_label, pick, stake, odds,
-            now_utc, r.get("status","OPEN"), r.get("result",""),
-            r.get("payout",""), r.get("net",""), r.get("settled_at","")
-        ]
-        sheet.update(f"A{row_no}:N{row_no}", [values], value_input_option="USER_ENTERED")
-    else:
-        append_bet_row(gw, user, match_id, match_label, pick, stake, odds)
-
-    user_total_stake_for_gw.clear()
-    open_bets_for_match.clear()
