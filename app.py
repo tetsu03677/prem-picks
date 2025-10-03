@@ -1,229 +1,199 @@
+# app.py
 from __future__ import annotations
-import json, uuid
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, List, Optional
+import json
+from datetime import datetime, timezone
+from typing import Optional
 
 import streamlit as st
 
-from google_sheets_client import read_config, load_users, read_odds, upsert_odds, read_bets, append_bet
-from football_api import fetch_fixtures_fd, simplify_matches
+from google_sheets_client import read_config, read_odds_map_for_gw
+from football_api import fetch_next_round_fd
 
-# ===== Common =====
+# ─────────────────────────────────────────────────────────────────────
+# ページ設定
 st.set_page_config(page_title="Premier Picks", page_icon="⚽", layout="wide")
 
-def tz(conf: Dict[str,str]) -> timezone:
-    # 表示用は常にJST相当でOK（詳細は省略）
-    return timezone(timedelta(hours=9))
+TZ_UTC = timezone.utc
 
-def guard_login():
-    if not st.session_state.get("user"):
-        st.stop()
+# ─────────────────────────────────────────────────────────────────────
+# 共通ユーティリティ
+def _localize(dt_utc: datetime, tz_name: str) -> datetime:
+    from zoneinfo import ZoneInfo
+    return dt_utc.astimezone(ZoneInfo(tz_name))
 
-def is_admin() -> bool:
-    u = st.session_state.get("user")
-    return u and u.get("role") == "admin"
+def _current_user() -> Optional[dict]:
+    return st.session_state.get("user")
 
-# ===== Login View =====
+def _logout():
+    for k in ("user",):
+        if k in st.session_state:
+            del st.session_state[k]
+    st.rerun()
+
+# ─────────────────────────────────────────────────────────────────────
+# ログイン画面
 def show_login():
-    st.markdown("### ログイン")
-    users = load_users()
-    if "login_message" in st.session_state:
-        st.info(st.session_state.pop("login_message"))
-    with st.form("login"):
-        col1, col2 = st.columns(2)
-        username = col1.text_input("ユーザー名")
-        password = col2.text_input("パスワード", type="password")
-        submitted = st.form_submit_button("ログイン", use_container_width=True)
-    if submitted:
-        hit = next((u for u in users if u.get("username")==username and u.get("password")==password), None)
-        if not hit:
-            st.error("ユーザー名またはパスワードが違います。")
-        else:
-            st.session_state["user"] = hit
-            st.session_state["login_message"] = f"{hit['username']} としてログインしました。"
+    st.markdown("### 🔐 ログイン")
+    conf = read_config()
+
+    # users_json は config シートの JSON 文字列
+    users_json = conf.get("users_json", "").strip()
+    user_list = []
+    try:
+        user_list = json.loads(users_json) if users_json else []
+    except Exception:
+        st.error("configシートの users_json が不正です。JSON配列にしてください。")
+        return
+
+    if not user_list:
+        st.error("ログインユーザーが定義されていません（configシート users_json）。")
+        return
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        usernames = [u.get("username", "") for u in user_list]
+        sel = st.selectbox("ユーザー", usernames, index=0)
+    with col2:
+        pw = st.text_input("パスワード", type="password")
+
+    if st.button("ログイン", type="primary", use_container_width=True):
+        # 照合
+        record = next((u for u in user_list if u.get("username") == sel), None)
+        if record and pw == record.get("password"):
+            st.session_state["user"] = {
+                "username": record.get("username"),
+                "role": record.get("role", "user"),
+                "team": record.get("team", ""),
+            }
+            st.success("ログインしました。")
             st.rerun()
+        else:
+            st.error("ユーザー名またはパスワードが違います。")
 
-# ===== Top Nav Tabs =====
-def top_tabs() -> int:
-    tabs = st.tabs(["🏠 トップ","🎯 試合とベット","🗂 履歴","⏱ リアルタイム","🛠 オッズ管理"])
-    # 返り値のために index を保持
-    for i, t in enumerate(tabs):
-        with t:
-            st.session_state["_active_tab"] = i
-    return st.session_state.get("_active_tab", 0)
+    st.caption("※ユーザー定義は Google スプレッドシート config!B7 の users_json にあります。")
 
-# ===== Cards =====
-def match_card(m: Dict[str,Any], odds: Optional[Dict[str,Any]]=None):
-    h, a = m["home"], m["away"]
-    dt_utc = datetime.fromisoformat(m["utc"].replace("Z","+00:00"))
-    dt_local = dt_utc.astimezone(tz({}))
-    st.markdown(f"**GW{m.get('matchday','?')}** 　{dt_local:%m/%d %H:%M} 　{h} vs {a}")
-    if odds:
-        st.caption(f"オッズ: H {odds.get('home_win','-')} / D {odds.get('draw','-')} / A {odds.get('away_win','-')}"
-                   + ("　🔒Locked" if str(odds.get("locked","")).lower() in ("1","true","yes") else ""))
+# ─────────────────────────────────────────────────────────────────────
+# 画面: トップ
+def render_home():
+    u = _current_user()
+    st.markdown("### 🏠 トップ")
+    st.write(f"ようこそ **{u['username']}** さん！")
 
-# ====== Views ======
-def view_home():
-    st.markdown("## Premier Picks")
-    st.success("ログイン済みです。上部のタブから操作してください。")
-
-def view_bets():
-    conf = read_config()
-    col = st.slider("何日先まで表示するか", 3, 21, 14)
-    try:
-        raw = fetch_fixtures_fd(conf, col)
-        matches = simplify_matches(raw)
-    except Exception as e:
-        st.error(f"試合データ取得エラー: {e}")
-        return
-
-    gw = conf.get("current_gw","")
-    odds_all = { (str(o.get("gw")), str(o.get("match_id"))) : o for o in read_odds(gw) }
-    st.markdown("### 試合一覧")
-    for m in matches:
-        key = (str(gw), str(m["id"]))
-        o = odds_all.get(key)
-        with st.container(border=True):
-            match_card(m, o)
-            # オッズがある時だけベットフォーム
-            if o and str(o.get("locked","")).lower() not in ("1","true","yes"):
-                with st.form(f"bet_{m['id']}"):
-                    pick = st.selectbox("Pick", ["Home","Draw","Away"], key=f"p_{m['id']}")
-                    stake = st.number_input("Stake", min_value=0, step=int(conf.get("stake_step","100")), value=0, key=f"s_{m['id']}")
-                    submitted = st.form_submit_button("ベットする", use_container_width=True)
-                if submitted and stake>0:
-                    odds_val = {"Home": o.get("home_win"), "Draw": o.get("draw"), "Away": o.get("away_win")}[pick]
-                    rec = {
-                        "key": str(uuid.uuid4())[:8],
-                        "gw": gw,
-                        "user": st.session_state["user"]["username"],
-                        "match_id": m["id"],
-                        "match": f"{m['home']} vs {m['away']}",
-                        "pick": pick,
-                        "stake": stake,
-                        "odds": odds_val,
-                        "placed_at": datetime.utcnow().isoformat(timespec="seconds")+"Z",
-                        "status": "open",
-                        "result": "",
-                        "payout": "",
-                        "net": "",
-                        "settled_at": "",
-                    }
-                    append_bet(rec)
-                    st.success("ベットを記録しました。")
-            else:
-                st.info("オッズが未入力です（管理者が『オッズ管理』で入力してください）。")
-
-def view_history():
-    conf = read_config()
-    gw = conf.get("current_gw","")
-    bets = read_bets(gw)
-    mine = [b for b in bets if b.get("user")==st.session_state["user"]["username"]]
-    others = [b for b in bets if b.get("user")!=st.session_state["user"]["username"]]
-
-    st.markdown("### あなたのベット")
-    if not mine:
-        st.info("まだありません。")
-    for b in mine:
-        with st.container(border=True):
-            st.markdown(f"**{b['match']}**　Pick: {b['pick']}　Stake: {b['stake']}　Odds: {b['odds']}")
-            st.caption(f"{b['placed_at']} ／ Status: {b.get('status','open')}")
-
-    st.markdown("### みんなのベット")
-    for b in others:
-        with st.container(border=True):
-            st.markdown(f"**{b['user']}**　{b['match']}　Pick: {b['pick']}　Stake: {b['stake']}")
-
-def view_realtime():
-    st.markdown("### リアルタイム")
-    st.info("更新ボタンで最新状況を反映します。自動更新はしません。")
-    if st.button("更新", use_container_width=True):
-        st.success("（将来拡張）現在はプレースホルダです。")
-
-def view_odds_admin():
-    if not is_admin():
-        st.warning("管理者のみ利用できます。")
-        return
+# 画面: 試合とベット（次のGWのみ表示。7日超なら注意表示。オッズ未入力は仮=1.0）
+def render_matches_and_bets():
+    st.header("🎯 試合とベット")
 
     conf = read_config()
-    days = st.slider("何日先まで下書き取得するか（試合リスト用）", 3, 21, 14, key="odds_days")
-    try:
-        raw = fetch_fixtures_fd(conf, days)
-        matches = simplify_matches(raw)
-    except Exception as e:
-        st.error(f"試合データ取得エラー: {e}")
+    api_token = conf.get("FOOTBALL_DATA_API_TOKEN", "")
+    league_id = conf.get("API_FOOTBALL_LEAGUE_ID", "39")
+    season = conf.get("API_FOOTBALL_SEASON", "2025")
+    tzname = conf.get("timezone", "Asia/Tokyo")
+
+    if not api_token:
+        st.error("FOOTBALL_DATA_API_TOKEN が未設定です（config シート）。")
         return
 
-    gw = conf.get("current_gw","")
-    st.markdown(f"#### GW {gw} のオッズ編集")
-    current = {(str(o.get("match_id"))): o for o in read_odds(gw)}
-    edited_rows: List[Dict[str,Any]] = []
+    with st.spinner("試合データ取得中…"):
+        try:
+            resp = fetch_next_round_fd(api_token, league_id, season)
+        except Exception as e:
+            st.error(f"試合データ取得エラー: {e}")
+            return
 
-    for m in matches:
-        mid = str(m["id"])
-        o = current.get(mid, {})
-        with st.expander(f"{m['home']} vs {m['away']}"):
-            c1,c2,c3,c4 = st.columns([1,1,1,1])
-            home = c1.number_input("Home", min_value=0.0, step=0.01, value=float(o.get("home_win",0) or 0), key=f"h_{mid}")
-            draw = c2.number_input("Draw", min_value=0.0, step=0.01, value=float(o.get("draw",0) or 0), key=f"d_{mid}")
-            away = c3.number_input("Away", min_value=0.0, step=0.01, value=float(o.get("away_win",0) or 0), key=f"a_{mid}")
-            locked = c4.checkbox("Locked（確定）", value=str(o.get("locked","")).lower() in ("1","true","yes"), key=f"l_{mid}")
-            edited_rows.append({
-                "gw": gw,
-                "match_id": mid,
-                "home": m["home"],
-                "away": m["away"],
-                "home_win": home or "",
-                "draw": draw or "",
-                "away_win": away or "",
-                "locked": "1" if locked else "",
-                "updated_at": datetime.utcnow().isoformat(timespec="seconds")+"Z",
-            })
+    fixtures = resp.get("fixtures") or []
+    first_utc: datetime | None = resp.get("earliest_utc")
+    gw = resp.get("matchday")
 
-    if st.button("この内容で保存", use_container_width=True, type="primary"):
-        upsert_odds(edited_rows, gw)
-        st.success("odds シートを更新しました。")
-        st.cache_data.clear()  # odds のキャッシュを一掃
-        st.rerun()
+    if not fixtures or not first_utc or not gw:
+        st.info("予定された試合が見つかりません。")
+        return
 
-# ===== main =====
+    now_utc = datetime.now(TZ_UTC)
+    delta_days = (first_utc - now_utc).total_seconds() / 86400.0
+
+    if delta_days > 7.0:
+        first_local = _localize(first_utc, tzname)
+        st.warning(
+            f"7日以内に次のGWはありません。次のGW({gw})の最初のキックオフ: "
+            f"{first_local.strftime('%m/%d %H:%M')}"
+        )
+        return
+
+    odds_map = read_odds_map_for_gw(int(gw))
+
+    st.subheader(f"試合一覧（GW{gw}）")
+    for m in fixtures:
+        match_id = str(m["match_id"])
+        ko_local = _localize(datetime.fromisoformat(m["utc"]), tzname)
+        home = m["home"]
+        away = m["away"]
+
+        od = odds_map.get(match_id, {"home": 1.0, "draw": 1.0, "away": 1.0, "locked": False})
+        is_placeholder = (od["home"] == 1.0 and od["draw"] == 1.0 and od["away"] == 1.0)
+
+        with st.container(border=True):
+            c1, c2 = st.columns([1, 3])
+            with c1:
+                st.markdown(f"**GW{gw}**")
+                st.caption(ko_local.strftime("%m/%d %H:%M"))
+            with c2:
+                st.markdown(f"**{home} vs {away}**")
+                if is_placeholder:
+                    st.info("オッズ未入力のため仮オッズ（=1.0）を表示中。管理者は『オッズ管理』で設定してください。")
+                st.markdown(
+                    f"- Home: **{od['home']:.2f}**"
+                    f"　• Draw: **{od['draw']:.2f}**"
+                    f"　• Away: **{od['away']:.2f}**"
+                )
+                # （v1）ここにベットUIは未配置。今は閲覧優先。
+
+# 画面: 履歴（プレースホルダ）
+def render_history():
+    st.header("📁 履歴")
+    st.info("履歴ページは今後実装します。まずは試合一覧とオッズ管理を先に仕上げます。")
+
+# 画面: リアルタイム（プレースホルダ）
+def render_realtime():
+    st.header("⏱ リアルタイム")
+    st.info("リアルタイムページは今後実装します。")
+
+# 画面: オッズ管理（管理者のみ・プレースホルダ）
+def render_odds_admin():
+    st.header("🛠 オッズ管理（管理者）")
+    st.info("このページから次のGWの各試合にオッズを入力・ロックできるようにします。（次のステップで実装）")
+
+# ─────────────────────────────────────────────────────────────────────
+# メイン
 def main():
-    st.markdown(
-        """
-        <style>
-          /* モバイル向けに少し文字小さめ＆上タブをくっきり */
-          .stTabs [data-baseweb="tab"] div {font-size:0.9rem}
-          .stButton>button {height: 2.4rem;}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # 未ログインならログイン画面
-    if not st.session_state.get("user"):
+    user = _current_user()
+    if not user:
         show_login()
         return
 
-    # ログアウトボタン
-    with st.sidebar:
-        st.markdown(f"**User:** {st.session_state['user']['username']}")
-        if st.button("ログアウト", use_container_width=True):
-            st.session_state.clear()
-            st.rerun()
+    # 右上にログアウト
+    with st.container():
+        st.markdown(
+            f"<div style='text-align:right'>"
+            f"ログイン中：<b>{user['username']}</b>（{user.get('role','user')}） "
+            f"<button onclick='window.location.reload()' style='display:none'></button>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        st.button("ログアウト", on_click=_logout)
 
-    # タブ表示
-    t1, t2, t3, t4, t5 = st.tabs(["🏠 トップ","🎯 試合とベット","🗂 履歴","⏱ リアルタイム","🛠 オッズ管理"])
+    # 上部タブ（日本語）
+    admin = (user.get("role") == "admin")
+    if admin:
+        tabs = st.tabs(["🏠 トップ", "🎯 試合とベット", "📁 履歴", "⏱ リアルタイム", "🛠 オッズ管理"])
+        pages = [render_home, render_matches_and_bets, render_history, render_realtime, render_odds_admin]
+    else:
+        tabs = st.tabs(["🏠 トップ", "🎯 試合とベット", "📁 履歴", "⏱ リアルタイム"])
+        pages = [render_home, render_matches_and_bets, render_history, render_realtime]
 
-    with t1:  # Home
-        view_home()
-    with t2:  # Bets
-        view_bets()
-    with t3:  # History
-        view_history()
-    with t4:  # Realtime
-        view_realtime()
-    with t5:  # Odds Admin
-        view_odds_admin()
+    for tab, page in zip(tabs, pages):
+        with tab:
+            page()
 
+# ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()
