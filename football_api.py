@@ -11,7 +11,6 @@ def _base() -> Dict[str, Any]:
     key = conf.get("RAPIDAPI_KEY", "").strip()
     if not key:
         raise RuntimeError("RAPIDAPI_KEY が config シートにありません。")
-    # RapidAPI host は v1 と無印の2種類が返ることがあるので冗長に保持
     return {
         "key": key,
         "hosts": ["api-football-v1.p.rapidapi.com", "api-football.p.rapidapi.com"],
@@ -32,8 +31,7 @@ def _get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
             last_err = f"{r.status_code} {r.text[:200]}"
         except Exception as e:
             last_err = str(e)
-        # 少し待ってからフォールバック
-        time.sleep(0.4)
+        time.sleep(0.3)
     raise RuntimeError(f"API-Football 呼び出し失敗: {last_err}")
 
 # ---- 公開API -------------------------------------------------------------
@@ -58,7 +56,6 @@ def get_odds_for_fixture(fixture_id: int) -> Dict[str, Any]:
     返り値例: {"1": 1.85, "X": 3.60, "2": 4.2}
     """
     data = _get("/odds", {"fixture": fixture_id})
-    # 返却構造: response[0].bookmakers[].bets[].values[]
     resp = data.get("response", [])
     if not resp:
         return {}
@@ -68,9 +65,9 @@ def get_odds_for_fixture(fixture_id: int) -> Dict[str, Any]:
             if bet.get("name", "").lower() in ("match winner", "match-winner", "1x2"):
                 out = {}
                 for v in bet.get("values", []):
-                    label = v.get("value")  # "Home", "Draw", "Away" など
+                    label = (v.get("value") or "").strip()
                     odd = v.get("odd")
-                    if not (label and odd):
+                    if not odd:
                         continue
                     if label.lower().startswith("home") or label == "1":
                         out["1"] = float(odd)
