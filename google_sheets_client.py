@@ -1,15 +1,12 @@
 # google_sheets_client.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import os
-import json
 from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime, timezone
 
-# --- Google Sheets client ----------------------------------------------------
 _SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 _CLIENT = None
 _SHEET = None
@@ -18,7 +15,6 @@ def _client():
     global _CLIENT
     if _CLIENT:
         return _CLIENT
-    # secrets.toml の [gcp_service_account] と [sheets] を使う
     info = dict(st.secrets["gcp_service_account"])
     creds = Credentials.from_service_account_info(info, scopes=_SCOPES)
     _CLIENT = gspread.authorize(creds)
@@ -35,16 +31,14 @@ def _spreadsheet():
 def ws(sheet_name: str):
     return _spreadsheet().worksheet(sheet_name)
 
-# --- helpers -----------------------------------------------------------------
 def _records(wks) -> List[Dict[str, Any]]:
-    """1行目をヘッダとしてレコード化（空行はスキップ）"""
     values = wks.get_all_values()
     if not values:
         return []
     headers = [h.strip() for h in values[0]]
-    out = []
+    out: List[Dict[str, Any]] = []
     for row in values[1:]:
-        if not any(cell.strip() for cell in row):
+        if not any(c.strip() for c in row):
             continue
         rec = {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
         out.append(rec)
@@ -54,10 +48,8 @@ def read_rows_by_sheet(sheet_name: str) -> List[Dict[str, Any]]:
     return _records(ws(sheet_name))
 
 def read_config() -> Dict[str, Any]:
-    """config シート： key,value を dict 化"""
-    rows = read_rows_by_sheet("config")
-    conf = {}
-    for r in rows:
+    conf: Dict[str, Any] = {}
+    for r in read_rows_by_sheet("config"):
         k = r.get("key", "").strip()
         v = r.get("value", "").strip()
         if k:
@@ -67,18 +59,16 @@ def read_config() -> Dict[str, Any]:
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-# ---- odds -------------------------------------------------------------------
+# --- odds ---
 def read_odds(gw: str) -> Dict[str, Dict[str, Any]]:
-    """odds シートを読み込み、{match_id: {...}} に整形"""
+    out: Dict[str, Dict[str, Any]] = {}
     try:
         rows = read_rows_by_sheet("odds")
     except Exception:
-        return {}
-    out = {}
+        return out
     for r in rows:
-        if r.get("gw") != gw:
-            continue
-        out[r.get("match_id")] = r
+        if r.get("gw") == gw:
+            out[r.get("match_id")] = r
     return out
 
 def upsert_odds_row(gw: str, match_id: str, home: str, away: str,
@@ -89,7 +79,7 @@ def upsert_odds_row(gw: str, match_id: str, home: str, away: str,
     idx = None
     for i, r in enumerate(rows):
         if r.get("gw") == gw and r.get("match_id") == match_id:
-            idx = i + 2  # シート行番号
+            idx = i + 2
             break
     rec = {
         "gw": gw, "match_id": match_id, "home": home, "away": away,
@@ -100,10 +90,9 @@ def upsert_odds_row(gw: str, match_id: str, home: str, away: str,
     if idx:
         w.update(f"A{idx}:{chr(64+len(headers))}{idx}", [row])
     else:
-        # 追加
         w.append_row(row, value_input_option="USER_ENTERED")
 
-# ---- bets -------------------------------------------------------------------
+# --- bets ---
 def read_bets(gw: str) -> List[Dict[str, Any]]:
     try:
         rows = read_rows_by_sheet("bets")
@@ -113,7 +102,6 @@ def read_bets(gw: str) -> List[Dict[str, Any]]:
 
 def upsert_bet(gw: str, user: str, match_id: str, match: str,
                pick: str, stake: int, odds: float, placed_at_iso: Optional[str] = None):
-    """bets の主キーは (gw, user, match_id)"""
     w = ws("bets")
     rows = _records(w)
     headers = [h.strip() for h in w.row_values(1)]
@@ -125,7 +113,7 @@ def upsert_bet(gw: str, user: str, match_id: str, match: str,
     rec = {
         "key": f"{gw}:{user}:{match_id}",
         "gw": gw, "user": user, "match_id": match_id, "match": match,
-        "pick": pick, "stake": str(stake), "odds": str(odds),
+        "pick": pick, "stake": str(stake), "odds": f"{odds}",
         "placed_at": placed_at_iso or _now_utc_iso(),
         "status": "OPEN", "result": "", "payout": "", "net": "", "settled_at": ""
     }
