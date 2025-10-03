@@ -1,134 +1,88 @@
-import time
-from datetime import datetime, timedelta, timezone
-
-import requests
+# pages/99_API_Check.py
+# RapidAPI / API-FOOTBALL への疎通確認ページ
+from __future__ import annotations
 import streamlit as st
 
 from google_sheets_client import read_config
+from football_api import (
+    get_fixtures_next_days,
+    get_fixtures_by_league_and_season,
+    get_odds_for_fixture,
+)
+
+st.set_page_config(page_title="API 接続チェック", page_icon="🧪", layout="wide")
 
 
-def _tz_aware_range(days: int, tz_name: str) -> tuple[str, str]:
-    # RapidAPI(API-FOOTBALL)はISO8601文字列の from/to を受け付ける
-    # 例: "2025-10-03", "2025-10-17"
-    # タイムゾーンは日付だけ渡すので実質影響なし（見やすさのため保持）
-    now = datetime.now(timezone.utc)
-    start = (now).date().isoformat()
-    end = (now + timedelta(days=days)).date().isoformat()
-    return start, end
-
-
-def _api_call(path: str, params: dict, key: str) -> dict:
-    url = f"https://api-football-v1.p.rapidapi.com/v3/{path}"
-    headers = {
-        "x-rapidapi-key": key,
-        "x-rapidapi-host": "api-football.p.rapidapi.com",
-    }
-    r = requests.get(url, headers=headers, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
+def _pill(text: str, color: str = "gray"):
+    st.markdown(
+        f"""
+        <span style="
+            display:inline-block;padding:3px 8px;border-radius:999px;
+            background:{color};color:white;font-size:12px;">
+            {text}
+        </span>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def main():
-    st.set_page_config(page_title="API接続チェック", page_icon="🧪", layout="wide")
-    st.title("🧪 API 接続チェック（RapidAPI / API-FOOTBALL）")
+    st.markdown("## 🧪 API 接続チェック（RapidAPI / API-FOOTBALL） ↪︎")
 
-    conf = read_config()
-    key = conf.get("RAPIDAPI_KEY", "")
-    league = int(conf.get("API_FOOTBALL_LEAGUE_ID", "39"))
-    season = int(conf.get("API_FOOTBALL_SEASON", "2025"))
-    bookmaker = int(conf.get("ODDS_BOOKMAKER_ID", "8"))     # bet365
-    bet_market = int(conf.get("ODDS_MARKET", "1"))          # 1 = 1X2
-    tz_name = conf.get("timezone", "Asia/Tokyo")
+    days = st.slider("何日先までチェックするか", 3, 21, 14)
+    if st.button("▶︎ 接続テストを実行", use_container_width=True):
+        try:
+            conf = read_config()
 
-    if not key:
-        st.error("RAPIDAPI_KEY が config シートにありません。")
-        return
+            # 設定の概要
+            c1, c2, c3, c4 = st.columns(4)
+            c1.write(f"**League ID**: {conf.get('API_FOOTBALL_LEAGUE_ID', '39')}")
+            c2.write(f"**Season**: {conf.get('API_FOOTBALL_SEASON', '2025')}")
+            c3.write(f"**Bookmaker**: {conf.get('bookmaker_username', 'Bet365')}")
+            c4.write(f"**ODDS_MARKET**: {conf.get('ODDS_MARKET', '1')} (1=1X2)")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        days = st.slider("何日先までチェックするか", 3, 21, 14, help="from/to で直近期間を指定して叩きます")
-    with col2:
-        if st.button("▶ 接続テストを実行", use_container_width=True):
-            with st.spinner("APIに接続しています…"):
-                try:
-                    # 期間レンジ
-                    date_from, date_to = _tz_aware_range(days, tz_name)
+            st.divider()
 
-                    # --- Fixtures（試合予定） ---
-                    fx_params = dict(
-                        league=league,
-                        season=season,
-                        _from=date_from,
-                        to=date_to,
-                        timezone=tz_name,
+            # 1) Fixtures（リーグ＋シーズンで & 日付絞り）
+            st.caption("Fixtures を取得中…")
+            fixtures = get_fixtures_next_days(days=days)
+            total = len(fixtures)
+            if total == 0:
+                _pill("0 fixtures", "#d9534f")
+                st.warning("この期間では試合が見つかりませんでした。日付範囲やシーズンをご確認ください。")
+                return
+
+            _pill(f"{total} fixtures", "#5cb85c")
+            with st.expander("サンプル（上位3件）", expanded=False):
+                for fx in fixtures[:3]:
+                    f = fx["fixture"]
+                    t = fx["teams"]
+                    st.write(
+                        f"- **{t['home']['name']} vs {t['away']['name']}**  "
+                        f"({f['date']})  / fixture_id={f['id']}"
                     )
-                    fixtures = _api_call("fixtures", fx_params, key)
-                    fx_list = fixtures.get("response", [])
 
-                    st.success(f"Fixtures OK: {len(fx_list)} 試合取得")
-                    if not fx_list:
-                        st.info("期間内に取得できる試合がありませんでした。リーグ/シーズン/日付範囲を見直してください。")
+            st.divider()
 
-                    # サンプル1件
-                    sample_fx = None
-                    for f in fx_list:
-                        # Not Started中心に1件
-                        if f.get("fixture", {}).get("status", {}).get("short") in ("NS", "TBD"):
-                            sample_fx = f
-                            break
-                    if not sample_fx and fx_list:
-                        sample_fx = fx_list[0]
+            # 2) 1つ目の fixture でオッズ取得
+            target_id = fixtures[0]["fixture"]["id"]
+            st.caption(f"fixture_id={target_id} の 1X2 オッズを取得中…")
+            odds_json = get_odds_for_fixture(target_id)
 
-                    if sample_fx:
-                        fid = sample_fx["fixture"]["id"]
-                        card = f"{sample_fx['teams']['home']['name']} vs {sample_fx['teams']['away']['name']}"
-                        kickoff = sample_fx["fixture"]["date"]
-                        st.write(f"例: fixture_id={fid} / {card} / kick-off={kickoff}")
+            results = odds_json.get("results", 0)
+            if results == 0:
+                _pill("odds: 0", "#f0ad4e")
+                st.info("この試合はまだオッズが配信されていない可能性があります。")
+            else:
+                _pill(f"odds: {results}", "#5bc0de")
+                # 代表的な抜粋表示（1X2）
+                with st.expander("オッズ JSON（抜粋）", expanded=False):
+                    st.json(odds_json)
 
-                    # --- Odds（1X2 / bet365） ---
-                    # 注意: オッズは近い試合しか入らないことがあります。league/season/bookmaker/bet+期間で取得。
-                    od_params = dict(
-                        league=league,
-                        season=season,
-                        bookmaker=bookmaker,
-                        bet=bet_market,
-                        _from=date_from,
-                        to=date_to,
-                    )
-                    odds = _api_call("odds", od_params, key)
-                    od_list = odds.get("response", [])
+            st.success("✅ 接続テストは正常に完了しました。")
+        except Exception as e:
+            st.error(f"HTTPError: {e}")
 
-                    # 件数
-                    st.success(f"Odds OK: {len(od_list)} 試合分のオッズ候補")
-
-                    # サンプル表示（fixture.id一致を探す）
-                    if sample_fx:
-                        fid = sample_fx["fixture"]["id"]
-                        match_odds = None
-                        for item in od_list:
-                            if item.get("fixture", {}).get("id") == fid:
-                                match_odds = item
-                                break
-                        if match_odds:
-                            # 1X2（Home/Draw/Away）抽出
-                            try:
-                                bm = match_odds["bookmakers"][0]
-                                bet = next(b for b in bm["bets"] if int(b["id"]) == bet_market or b["name"] == "Match Winner")
-                                values = {v["value"]: v["odd"] for v in bet["values"]}
-                                st.write("この試合のオッズ（bet365 / 1X2）: ", values)
-                            except Exception:
-                                st.info("取得できたが、1X2 の値の展開に失敗（レスポンス形状が想定外）。")
-                        else:
-                            st.info("期間・条件内にサンプル試合のオッズが見つかりませんでした（オッズは直前にしか出ないことがあります）。")
-
-                    st.balloons()
-                except requests.HTTPError as e:
-                    st.error(f"HTTPError: {e.response.status_code} {e.response.text[:240]}")
-                except Exception as e:
-                    st.exception(e)
-
-    st.caption("※ このページは接続確認用の一時ページです。通ったら削除してOK。")
-    
 
 if __name__ == "__main__":
     main()
