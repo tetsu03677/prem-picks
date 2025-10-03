@@ -3,6 +3,16 @@ from datetime import datetime, timedelta, timezone
 import pytz
 import streamlit as st
 
+import streamlit as st
+
+# ← ここで最初にページ設定を一度だけ
+st.set_page_config(
+    page_title="Premier Picks",
+    page_icon="⚽",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
 from google_sheets_client import read_config, upsert_bet_row, read_bets
 from football_api import get_next_fixtures
 
@@ -291,7 +301,6 @@ def router():
 
 # ====== App entry ======
 def main():
-    st.set_page_config(page_title="Premier Picks", page_icon="⚽", layout="wide")
     navbar()
     if st.session_state.get("is_authenticated"):
         router()
