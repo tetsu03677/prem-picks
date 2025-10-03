@@ -1,8 +1,7 @@
 # google_sheets_client.py
 from __future__ import annotations
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime, timezone
-import json
 import streamlit as st
 import gspread
 
@@ -11,7 +10,6 @@ UTC = timezone.utc
 # ── 接続 ─────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def _gc():
-    # secrets.toml の gcp_service_account を使用
     creds_dict = st.secrets["gcp_service_account"]
     return gspread.service_account_from_dict(creds_dict)
 
@@ -56,7 +54,7 @@ def read_odds_map_for_gw(gw: int) -> Dict[str, Dict[str, Any]]:
         }
     return odmap
 
-# ── bets 合計金額（そのGWの自分の投票合計）を算出 ────────────────
+# ── 指定GWの自分の合計ステーク ────────────────────────────────
 @st.cache_data(ttl=10, show_spinner=False)
 def user_total_stake_for_gw(user: str, gw: int) -> int:
     sheet = ws("bets")
@@ -70,7 +68,23 @@ def user_total_stake_for_gw(user: str, gw: int) -> int:
                 pass
     return total
 
-# ── ベットを一行追記 ─────────────────────────────────────────────
+# ── その試合に対する自分のベットを取得（行番号つき） ──────────────
+def get_user_bet_for_match(user: str, gw: int, match_id: str) -> Optional[Tuple[int, Dict[str, Any]]]:
+    """見出し行を1としてカウント。返り値: (row_number, row_dict) か None"""
+    sheet = ws("bets")
+    rows = sheet.get_all_records()
+    # get_all_records は2行目からが最初のデータ。行番号=index+2
+    for idx, r in enumerate(rows):
+        if (
+            str(r.get("gw", "")) == str(gw)
+            and str(r.get("user", "")) == user
+            and str(r.get("match_id", "")) == str(match_id)
+            and str(r.get("status", "OPEN")).upper() == "OPEN"
+        ):
+            return idx + 2, r
+    return None
+
+# ── 追記（新規ベット） ───────────────────────────────────────
 def append_bet_row(
     gw: int,
     user: str,
@@ -84,23 +98,39 @@ def append_bet_row(
     now_utc = datetime.now(UTC).isoformat()
     key = f"{gw}-{user}-{match_id}-{int(datetime.now().timestamp())}"
 
-    # シート列: key, gw, user, match_id, match, pick, stake, odds, placed_at, status, result, payout, net, settled_at
+    # 列: key, gw, user, match_id, match, pick, stake, odds, placed_at, status, result, payout, net, settled_at
     row = [
-        key,
-        gw,
-        user,
-        match_id,
-        match_label,
-        pick,
-        stake,
-        odds,
-        now_utc,
-        "OPEN",
-        "",     # result
-        "",     # payout
-        "",     # net
-        "",     # settled_at
+        key, gw, user, match_id, match_label, pick, stake, odds,
+        now_utc, "OPEN", "", "", "", ""
     ]
     sheet.append_row(row, value_input_option="USER_ENTERED")
-    # 合計額キャッシュをクリア
+    user_total_stake_for_gw.clear()
+
+# ── 更新（既存があれば上書き、なければ追記） ────────────────────
+def upsert_bet_row(
+    gw: int,
+    user: str,
+    match_id: str,
+    match_label: str,
+    pick: str,      # "HOME"/"DRAW"/"AWAY"
+    stake: int,
+    odds: float,
+) -> None:
+    sheet = ws("bets")
+    found = get_user_bet_for_match(user, gw, match_id)
+    now_utc = datetime.now(UTC).isoformat()
+
+    if found:
+        row_no, r = found
+        key = r.get("key", f"{gw}-{user}-{match_id}")
+        values = [
+            key, gw, user, match_id, match_label, pick, stake, odds,
+            now_utc, r.get("status","OPEN"), r.get("result",""),
+            r.get("payout",""), r.get("net",""), r.get("settled_at","")
+        ]
+        # A〜N の14列を丸ごと更新
+        sheet.update(f"A{row_no}:N{row_no}", [values], value_input_option="USER_ENTERED")
+    else:
+        append_bet_row(gw, user, match_id, match_label, pick, stake, odds)
+
     user_total_stake_for_gw.clear()
