@@ -11,14 +11,12 @@ def main():
     token = conf.get("FOOTBALL_DATA_API_TOKEN","")
     comp = conf.get("FOOTBALL_DATA_COMPETITION","PL")
     season = conf.get("API_FOOTBALL_SEASON","2025")
-    st.caption(f"Competition: {comp} / Season: {season}")
 
     if st.button("接続テストを実行"):
         try:
-            raw, reason = fetch_matches_next_window(7, comp, season, token)
-            st.success(f"OK: {len(raw)} matches")
-            tzname = conf.get("timezone","Asia/Tokyo")
-            sims = simplify_matches(raw, tzname)
+            raw, _ = fetch_matches_next_window(7, comp, season, token)
+            sims = simplify_matches(raw, conf.get("timezone","Asia/Tokyo"))
+            st.success(f"取得件数: {len(sims)}")
             for m in sims[:10]:
                 st.write(m)
         except Exception as e:
