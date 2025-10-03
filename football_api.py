@@ -1,64 +1,53 @@
-from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Any, Tuple
+# football_api.py
+# -*- coding: utf-8 -*-
+
 import requests
+from datetime import datetime, timedelta, timezone
 import pytz
+import streamlit as st
 
-FD_BASE = "https://api.football-data.org/v4"
-
-def _tz(tz_name: str):
-    try:
-        return pytz.timezone(tz_name)
-    except Exception:
-        return timezone.utc
-
-def _iso(d: datetime) -> str:
-    return d.strftime("%Y-%m-%d")
-
-def fetch_matches_window(days_ahead: int, competition: str, season: str, token: str, tz_name: str) -> Tuple[List[Dict[str, Any]], str]:
+# -----------------------------------------------------
+# football-data.org APIから次節の試合を取得
+# -----------------------------------------------------
+def get_upcoming(conf, days=7):
     """
-    Return upcoming matches within next `days_ahead` days for competition.
-    Each match dict: id, gw, utc_kickoff, local_kickoff, home, away, status.
-    GWは API の matchday があれば GW{n}、なければ season の current_gw を使う想定で、空なら "GW?"。
+    次節の試合データを取得する
+    - conf: config dict
+    - days: 何日先まで取得するか
+    戻り値: (matches, gw)
     """
-    now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
-    date_from = _iso(now_utc)
-    date_to = _iso(now_utc + timedelta(days=days_ahead))
+    token = conf.get("FOOTBALL_DATA_API_TOKEN")
+    comp = conf.get("FOOTBALL_DATA_COMPETITION", "2021")  # Premier League ID
+    season = conf.get("API_FOOTBALL_SEASON", "2025")
 
-    url = f"{FD_BASE}/competitions/{competition}/matches"
-    params = {"dateFrom": date_from, "dateTo": date_to, "season": season}
     headers = {"X-Auth-Token": token}
-    r = requests.get(url, params=params, headers=headers, timeout=30)
+    base = "https://api.football-data.org/v4/competitions"
+    date_from = datetime.utcnow().strftime("%Y-%m-%d")
+    date_to = (datetime.utcnow() + timedelta(days=days)).strftime("%Y-%m-%d")
+
+    url = f"{base}/{comp}/matches?season={season}&dateFrom={date_from}&dateTo={date_to}&status=SCHEDULED"
+
+    r = requests.get(url, headers=headers)
     r.raise_for_status()
     data = r.json()
 
-    results = []
-    gw_label = None
-    for m in (data.get("matches") or []):
-        mid = str(m.get("id"))
-        status = m.get("status")
-        utc_iso = m.get("utcDate")
-        try:
-            utc_dt = datetime.fromisoformat(utc_iso.replace("Z", "+00:00"))
-        except Exception:
-            continue
-        home = (m.get("homeTeam") or {}).get("name")
-        away = (m.get("awayTeam") or {}).get("name")
-        matchday = m.get("matchday")
-        gw = f"GW{matchday}" if matchday else "GW?"
-        if gw_label is None:
-            gw_label = gw
+    matches = []
+    gw = None
+    tz = pytz.timezone(conf.get("timezone", "Asia/Tokyo"))
 
-        local = utc_dt.astimezone(_tz(tz_name))
-        results.append({
+    for m in data.get("matches", []):
+        mid = str(m["id"])
+        gw = m.get("season", {}).get("currentMatchday") or f"GW{m.get('matchday')}"
+        utc_kickoff = datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00"))
+        local_kickoff = utc_kickoff.astimezone(tz)
+        matches.append({
             "id": mid,
             "gw": gw,
-            "utc_kickoff": utc_dt,
-            "local_kickoff": local,
-            "home": home,
-            "away": away,
-            "status": status,
+            "utc_kickoff": utc_kickoff,
+            "local_kickoff": local_kickoff,
+            "home": m["homeTeam"]["name"],
+            "away": m["awayTeam"]["name"],
+            "status": m["status"]
         })
 
-    # sort
-    results.sort(key=lambda x: x["utc_kickoff"])
-    return results, (gw_label or "GW?")
+    return matches, gw
