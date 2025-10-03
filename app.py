@@ -199,6 +199,11 @@ def render_matches_and_bets():
                     unsafe_allow_html=True,
                 )
             with right:
+                if not match_locked:
+                    st.success("OPEN", icon="✅")
+                else:
+                    st.error("LOCKED", icon="🔒")
+                    
                 st.success("OPEN", icon="✅") if not match_locked else st.error("LOCKED", icon="🔒")
 
             st.markdown(
