@@ -4,3 +4,4 @@ google-auth==2.33.0
 requests>=2.31.0
 python-dateutil>=2.9.0
 pytz>=2024.1
+streamlit-option-menu==0.3.6
