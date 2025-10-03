@@ -1,110 +1,87 @@
-# football_api.py
-# -*- coding: utf-8 -*-
-from __future__ import annotations
-from typing import Dict, Any, List, Tuple, Iterable
+# /football_api.py
 from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Tuple
 import requests
-import pytz
+import streamlit as st
 
-def _headers(conf: Dict[str, Any]) -> Dict[str, str]:
-    return {"X-Auth-Token": conf["FOOTBALL_DATA_API_TOKEN"]}
+JST = timezone(timedelta(hours=9))
+SESSION = requests.Session()
 
-def _tz(conf: Dict[str, Any]):
-    return pytz.timezone(conf.get("timezone", "Asia/Tokyo"))
+@st.cache_data(ttl=180, show_spinner=False)
+def _fd_headers() -> Dict[str, str]:
+    # app.py 側の read_config() で st.session_state["_conf_cache"] に格納済み
+    conf = st.session_state.get("_conf_cache") or {}
+    token = conf.get("FOOTBALL_DATA_API_TOKEN", "")
+    return {"X-Auth-Token": token} if token else {}
 
-def _iso_date(d: datetime) -> str:
-    return d.strftime("%Y-%m-%d")
-
-def get_upcoming(conf: Dict[str, Any], days: int = 7) -> Tuple[List[Dict[str, Any]], str]:
-    """7日固定で“次節”を取得（SCHEDULEDのみ）。GWは最初に見つかったmatchdayを使う。"""
-    competition = conf.get("FOOTBALL_DATA_COMPETITION", "2021")
-    season = conf.get("API_FOOTBALL_SEASON", "2025")
-    tz = _tz(conf)
-
-    today = datetime.utcnow().date()
-    date_from = _iso_date(datetime.utcnow())
-    date_to = _iso_date(datetime.utcnow() + timedelta(days=days))
-    url = (f"https://api.football-data.org/v4/competitions/{competition}/matches"
-           f"?season={season}&dateFrom={date_from}&dateTo={date_to}&status=SCHEDULED")
-    r = requests.get(url, headers=_headers(conf), timeout=20)
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_matches_window(days: int, competition: str = "2021", season: str = "2025") -> Tuple[Dict, Dict]:
+    """
+    football-data.org から直近days日分（今日～+days）の試合を取得
+    """
+    base = "https://api.football-data.org/v4/competitions"
+    frm = datetime.utcnow().date()
+    to = (datetime.utcnow().date() + timedelta(days=days))
+    url = f"{base}/{competition}/matches"
+    params = {
+        "dateFrom": frm.isoformat(),
+        "dateTo": to.isoformat(),
+        "season": season
+    }
+    h = _fd_headers()
+    if not h:
+        raise RuntimeError("FOOTBALL_DATA_API_TOKEN が設定されていません。config で設定してください。")
+    r = SESSION.get(url, headers=h, params=params, timeout=(3, 10))
     r.raise_for_status()
-    data = r.json()
+    js = r.json()
+    return js, {"from": frm.isoformat(), "to": to.isoformat()}
 
-    matches: List[Dict[str, Any]] = []
-    gw = None
-    for m in data.get("matches", []):
-        matchday = m.get("matchday")
-        if gw is None and matchday:
-            gw = f"GW{matchday}"
-        utc_dt = datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00"))
-        local_dt = utc_dt.astimezone(tz)
-        matches.append({
-            "id": str(m["id"]),
-            "gw": f"GW{matchday}" if matchday else (gw or conf.get("current_gw", "")),
-            "utc_kickoff": utc_dt,
-            "local_kickoff": local_dt,
-            "home": m["homeTeam"]["name"],
-            "away": m["awayTeam"]["name"],
-            "status": m.get("status","SCHEDULED"),
-        })
-    if gw is None:
-        gw = conf.get("current_gw", "GW?")
-    return matches, gw
-
-def get_matches_range(conf: Dict[str, Any], date_from: datetime, date_to: datetime) -> List[Dict[str, Any]]:
-    """ステータス制限なしで区間の試合（スコア含む）を取得。リアルタイム/履歴用。"""
-    competition = conf.get("FOOTBALL_DATA_COMPETITION", "2021")
-    season = conf.get("API_FOOTBALL_SEASON", "2025")
-    tz = _tz(conf)
-    url = (f"https://api.football-data.org/v4/competitions/{competition}/matches"
-           f"?season={season}&dateFrom={_iso_date(date_from)}&dateTo={_iso_date(date_to)}")
-    r = requests.get(url, headers=_headers(conf), timeout=20)
-    r.raise_for_status()
-    out: List[Dict[str, Any]] = []
-    for m in r.json().get("matches", []):
-        utc_dt = datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00"))
+def simplify_matches(js: Dict) -> List[Dict]:
+    """
+    APIレスポンスを画面用に薄く整形
+    """
+    out = []
+    for m in js.get("matches", []):
+        score = m.get("score", {})
+        full = score.get("fullTime", {}) or {}
+        ht = m.get("homeTeam", {}) or {}
+        at = m.get("awayTeam", {}) or {}
         out.append({
-            "id": str(m["id"]),
-            "gw": f"GW{m.get('matchday')}" if m.get('matchday') else "",
-            "utc_kickoff": utc_dt,
-            "local_kickoff": utc_dt.astimezone(tz),
-            "home": m["homeTeam"]["name"],
-            "away": m["awayTeam"]["name"],
-            "status": m.get("status",""),
-            "score": m.get("score",{}),  # includes fullTime/halfTime
+            "id": m.get("id"),
+            "utcDate": m.get("utcDate"),
+            "status": m.get("status"),
+            "matchday": m.get("matchday"),
+            "homeTeam": ht.get("shortName") or ht.get("name"),
+            "awayTeam": at.get("shortName") or at.get("name"),
+            "score": f"{full.get('home', 0)}-{full.get('away', 0)}",
         })
     return out
 
-def get_matches_by_ids(conf: Dict[str, Any], ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
-    """/matches/{id} を順次取得して辞書で返す（件数はbetsの実数想定でOK）"""
-    base = "https://api.football-data.org/v4/matches/"
-    out: Dict[str, Dict[str, Any]] = {}
-    tz = _tz(conf)
-    for mid in ids:
-        r = requests.get(base + str(mid), headers=_headers(conf), timeout=20)
-        if r.status_code == 404:
-            continue
-        r.raise_for_status()
-        m = r.json().get("match", {})
-        utc_dt = datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00"))
-        out[str(mid)] = {
-            "id": str(m.get("id")),
-            "gw": f"GW{m.get('matchday')}" if m.get('matchday') else "",
-            "utc_kickoff": utc_dt,
-            "local_kickoff": utc_dt.astimezone(tz),
-            "home": m.get("homeTeam",{}).get("name",""),
-            "away": m.get("awayTeam",{}).get("name",""),
-            "status": m.get("status",""),
-            "score": m.get("score",{}),
-        }
-    return out
+def get_match_result_symbol(m: Dict, treat_inplay_as_provisional: bool = False) -> str | None:
+    """
+    戻り値: "HOME" | "DRAW" | "AWAY" | None
+    treat_inplay_as_provisional=True の場合は IN_PLAY なども現在スコアで暫定判定
+    """
+    status = (m or {}).get("status")
+    sc = (m or {}).get("score", "0-0")
+    try:
+        h, a = [int(x) for x in sc.split("-")]
+    except Exception:
+        h, a = 0, 0
 
-def winner_from_score(score_obj: Dict[str, Any]) -> str | None:
-    """score.fullTime から HOME/DRAW/AWAY を返す。未確定は None"""
-    ft = score_obj.get("fullTime") or {}
-    h, a = ft.get("home"), ft.get("away")
-    if h is None or a is None:
-        return None
-    if h > a: return "HOME"
-    if h < a: return "AWAY"
-    return "DRAW"
+    if status == "FINISHED":
+        if h > a:
+            return "HOME"
+        elif h < a:
+            return "AWAY"
+        else:
+            return "DRAW"
+
+    if treat_inplay_as_provisional and status in {"IN_PLAY", "PAUSED"}:
+        if h > a:
+            return "HOME"
+        elif h < a:
+            return "AWAY"
+        else:
+            return "DRAW"
+    return None
