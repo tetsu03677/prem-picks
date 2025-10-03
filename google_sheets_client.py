@@ -1,148 +1,136 @@
-import time
-from typing import Dict, List, Any, Optional
+# google_sheets_client.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+import os
+import json
+from typing import List, Dict, Any, Optional
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
+from datetime import datetime, timezone
 
-# ====== Google Sheets base ======
+# --- Google Sheets client ----------------------------------------------------
+_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+_CLIENT = None
+_SHEET = None
+
 def _client():
+    global _CLIENT
+    if _CLIENT:
+        return _CLIENT
+    # secrets.toml の [gcp_service_account] と [sheets] を使う
     info = dict(st.secrets["gcp_service_account"])
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
-    return gspread.authorize(creds)
+    creds = Credentials.from_service_account_info(info, scopes=_SCOPES)
+    _CLIENT = gspread.authorize(creds)
+    return _CLIENT
 
-@st.cache_resource(show_spinner=False)
 def _spreadsheet():
-    gc = _client()
+    global _SHEET
+    if _SHEET:
+        return _SHEET
     ssid = st.secrets["sheets"]["sheet_id"]
-    return gc.open_by_key(ssid)
+    _SHEET = _client().open_by_key(ssid)
+    return _SHEET
 
 def ws(sheet_name: str):
     return _spreadsheet().worksheet(sheet_name)
 
-# ====== helpers ======
-def _records(w):
-    rows = w.get_all_records()
-    return rows
+# --- helpers -----------------------------------------------------------------
+def _records(wks) -> List[Dict[str, Any]]:
+    """1行目をヘッダとしてレコード化（空行はスキップ）"""
+    values = wks.get_all_values()
+    if not values:
+        return []
+    headers = [h.strip() for h in values[0]]
+    out = []
+    for row in values[1:]:
+        if not any(cell.strip() for cell in row):
+            continue
+        rec = {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
+        out.append(rec)
+    return out
 
-@st.cache_data(ttl=15, show_spinner=False)
 def read_rows_by_sheet(sheet_name: str) -> List[Dict[str, Any]]:
     return _records(ws(sheet_name))
 
 def read_config() -> Dict[str, Any]:
-    kv = {}
-    for r in read_rows_by_sheet("config"):
-        k = str(r.get("key") or "").strip()
-        v = r.get("value")
-        if k:
-            kv[k] = v
-    return kv
-
-def read_rows(sheet_name: str, where: Dict[str, Any]) -> List[Dict[str, Any]]:
-    rows = read_rows_by_sheet(sheet_name)
-    res = []
+    """config シート： key,value を dict 化"""
+    rows = read_rows_by_sheet("config")
+    conf = {}
     for r in rows:
-        ok = True
-        for k, v in where.items():
-            if str(r.get(k)) != str(v):
-                ok = False
-                break
-        if ok:
-            res.append(r)
-    return res
+        k = r.get("key", "").strip()
+        v = r.get("value", "").strip()
+        if k:
+            conf[k] = v
+    return conf
 
-def _find_row_index(w, key_value: str, key_field: str = "key") -> Optional[int]:
-    # returns 1-based row index (including header)
-    header = w.row_values(1)
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+# ---- odds -------------------------------------------------------------------
+def read_odds(gw: str) -> Dict[str, Dict[str, Any]]:
+    """odds シートを読み込み、{match_id: {...}} に整形"""
     try:
-        key_col = header.index(key_field) + 1
-    except ValueError:
-        raise RuntimeError(f"'{key_field}' column not found in {w.title}")
-    cell = w.find(key_value, in_column=key_col)
-    return cell.row if cell else None
-
-def upsert_row(sheet_name: str, key_value: str, data: Dict[str, Any], key_field: str = "key") -> None:
-    w = ws(sheet_name)
-    header = w.row_values(1)
-    if key_field not in header:
-        header.append(key_field)
-        w.update("A1", [header])
-
-    row_idx = None
-    try:
-        row_idx = _find_row_index(w, key_value, key_field)
-    except gspread.exceptions.APIError:
-        # find may rate-limit; ignore -> treat as new
-        row_idx = None
-
-    # ensure columns
-    for k in data.keys():
-        if k not in header:
-            header.append(k)
-    w.update("A1", [header])  # update header if changed
-
-    values = ["" for _ in header]
-    for i, col in enumerate(header):
-        if col == key_field:
-            values[i] = key_value
-        elif col in data:
-            values[i] = data[col]
-
-    if row_idx:
-        w.update(f"A{row_idx}", [values])
-    else:
-        w.append_row(values, value_input_option="USER_ENTERED")
-
-    # bust caches
-    read_rows_by_sheet.clear()
-
-# ===== Domain helpers for bets/odds =====
-def bets_for_match(gw: str, match_id: str) -> List[Dict[str, Any]]:
-    return read_rows("bets", {"gw": gw, "match_id": match_id})
-
-def user_bet_for_match(gw: str, match_id: str, user: str) -> Optional[Dict[str, Any]]:
-    for r in bets_for_match(gw, match_id):
-        if str(r.get("user")) == str(user):
-            return r
-    return None
-
-def user_total_stake_for_gw(gw: str, user: str) -> int:
-    total = 0
-    for r in read_rows("bets", {"gw": gw, "user": user}):
-        try:
-            total += int(float(r.get("stake") or 0))
-        except Exception:
-            pass
-    return total
-
-def odds_for_match(gw: str, match_id: str) -> Dict[str, Any]:
-    rows = read_rows("odds", {"gw": gw, "match_id": match_id})
-    if rows:
-        r = rows[0]
-        return {
-            "home_win": float(r.get("home_win") or 1.0),
-            "draw": float(r.get("draw") or 1.0),
-            "away_win": float(r.get("away_win") or 1.0),
-            "locked": str(r.get("locked") or "").lower() in ("1", "true", "yes"),
-            "home": r.get("home"),
-            "away": r.get("away"),
-            "updated_at": r.get("updated_at"),
-        }
-    return {"home_win": 1.0, "draw": 1.0, "away_win": 1.0, "locked": False}
-
-def aggregate_others(bets: List[Dict[str, Any]], me: str) -> Dict[str, int]:
-    res = {"HOME": 0, "DRAW": 0, "AWAY": 0}
-    for r in bets:
-        if str(r.get("user")) == str(me):
+        rows = read_rows_by_sheet("odds")
+    except Exception:
+        return {}
+    out = {}
+    for r in rows:
+        if r.get("gw") != gw:
             continue
-        pick = str(r.get("pick") or "").upper()
-        try:
-            amt = int(float(r.get("stake") or 0))
-        except Exception:
-            amt = 0
-        if pick in res:
-            res[pick] += amt
-    return res
+        out[r.get("match_id")] = r
+    return out
+
+def upsert_odds_row(gw: str, match_id: str, home: str, away: str,
+                    home_win: str, draw: str, away_win: str, locked: str) -> None:
+    w = ws("odds")
+    rows = _records(w)
+    headers = [h.strip() for h in w.row_values(1)]
+    idx = None
+    for i, r in enumerate(rows):
+        if r.get("gw") == gw and r.get("match_id") == match_id:
+            idx = i + 2  # シート行番号
+            break
+    rec = {
+        "gw": gw, "match_id": match_id, "home": home, "away": away,
+        "home_win": home_win, "draw": draw, "away_win": away_win,
+        "locked": locked, "updated_at": _now_utc_iso()
+    }
+    row = [rec.get(h, "") for h in headers]
+    if idx:
+        w.update(f"A{idx}:{chr(64+len(headers))}{idx}", [row])
+    else:
+        # 追加
+        w.append_row(row, value_input_option="USER_ENTERED")
+
+# ---- bets -------------------------------------------------------------------
+def read_bets(gw: str) -> List[Dict[str, Any]]:
+    try:
+        rows = read_rows_by_sheet("bets")
+    except Exception:
+        return []
+    return [r for r in rows if r.get("gw") == gw]
+
+def upsert_bet(gw: str, user: str, match_id: str, match: str,
+               pick: str, stake: int, odds: float, placed_at_iso: Optional[str] = None):
+    """bets の主キーは (gw, user, match_id)"""
+    w = ws("bets")
+    rows = _records(w)
+    headers = [h.strip() for h in w.row_values(1)]
+    row_idx = None
+    for i, r in enumerate(rows):
+        if r.get("gw") == gw and r.get("user") == user and r.get("match_id") == match_id:
+            row_idx = i + 2
+            break
+    rec = {
+        "key": f"{gw}:{user}:{match_id}",
+        "gw": gw, "user": user, "match_id": match_id, "match": match,
+        "pick": pick, "stake": str(stake), "odds": str(odds),
+        "placed_at": placed_at_iso or _now_utc_iso(),
+        "status": "OPEN", "result": "", "payout": "", "net": "", "settled_at": ""
+    }
+    row = [rec.get(h, "") for h in headers]
+    if row_idx:
+        w.update(f"A{row_idx}:{chr(64+len(headers))}{row_idx}", [row])
+    else:
+        w.append_row(row, value_input_option="USER_ENTERED")
