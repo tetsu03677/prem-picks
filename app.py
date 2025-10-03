@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Dict, List
 from datetime import datetime, timedelta
 from dateutil import tz
-
+import requests
 import streamlit as st
 
 from google_sheets_client import (
@@ -14,17 +14,8 @@ from football_api import fetch_matches_window
 # ============ 共通UI ============
 st.set_page_config(page_title="Premier Picks", page_icon="⚽", layout="centered")
 
-def pill(text: str, ok=True):
-    if ok:
-        st.success(text)
-    else:
-        st.error(text)
-
 def h3(text: str):
     st.markdown(f"<h3 style='margin:0.2rem 0 0.6rem 0'>{text}</h3>", unsafe_allow_html=True)
-
-def small_mono(text: str):
-    st.markdown(f"<div style='font-size:0.85rem;opacity:0.85'>{text}</div>", unsafe_allow_html=True)
 
 def big_team_label(home: str, away: str):
     st.markdown(
@@ -49,7 +40,6 @@ def show_login():
     conf = read_config()
     users = parse_users(conf)
     usernames = [u["username"] for u in users]
-
     with st.form("login"):
         u = st.selectbox("ユーザー", usernames, index=0)
         p = st.text_input("パスワード", type="password")
@@ -70,31 +60,40 @@ def need_login() -> bool:
 def page_matches_and_bets():
     conf = read_config()
     user = st.session_state["user"]["username"]
-    role = st.session_state["user"]["role"]
     tzname = conf.get("timezone","Asia/Tokyo")
     tzinfo = tz.gettz(tzname)
-
     current_gw = conf.get("current_gw","GW?")
-    st.markdown("### 🎯 試合とベット")
     used = user_total_stake_in_gw(user, current_gw)
     max_total = int(conf.get("max_total_stake_per_gw","5000"))
+    st.markdown("### 🎯 試合とベット")
     st.caption(f"このGWのあなたの投票合計: {used} / 上限 {max_total}（残り {max_total - used}）")
 
-    # 次節＝7日以内ロジック
-    matches, debug_url = fetch_matches_window(7, conf.get("API_FOOTBALL_LEAGUE_ID","39"), conf.get("API_FOOTBALL_SEASON","2025"))
+    # 7日以内の試合だけ
+    try:
+        matches, debug_url = fetch_matches_window(
+            7,
+            conf.get("API_FOOTBALL_LEAGUE_ID","39"),
+            conf.get("API_FOOTBALL_SEASON","2025")
+        )
+    except requests.HTTPError as e:
+        msg = e.response.text if getattr(e, "response", None) is not None else str(e)
+        st.error("試合データの取得に失敗しました。時間をおいて再実行してください。")
+        with st.expander("詳細"):
+            st.code(msg)
+        return
+
     if not matches:
         st.info("7日以内に次節はありません。")
         return
 
-    # 取得時刻 / デバッグ
-    with st.expander("取得情報"):
+    with st.expander("取得URL（デバッグ）"):
         st.code(debug_url, language="text")
 
     odds_map = read_odds()
     stake_step = int(conf.get("stake_step","100"))
     lock_before = int(conf.get("lock_minutes_before_earliest","120"))
 
-    # 最も早いKO
+    # 一番早いKOを見てロック閾値を決定
     earliest = None
     for m in matches:
         dt = datetime.fromisoformat(m["utcDate"].replace("Z","+00:00"))
@@ -108,19 +107,16 @@ def page_matches_and_bets():
         ko_local = ko_utc.astimezone(tzinfo)
         match_locked = lock_threshold is not None and datetime.utcnow() >= lock_threshold
 
-        st.container()
         with st.container(border=True):
-            # 行頭バッジ
             st.markdown(f"**{current_gw}** ・ {ko_local.strftime('%m/%d %H:%M')}")
             big_team_label(m["home"], m["away"])
 
-            # 状態バッジ（式ではなく文で）
             if not match_locked:
                 st.success("OPEN", icon="✅")
             else:
                 st.error("LOCKED", icon="🔒")
 
-            # オッズ
+            # オッズ（未入力は仮=1.0）
             rec = odds_map.get(mid)
             if rec and (rec["home_win"] and rec["draw"] and rec["away_win"]):
                 home_o, draw_o, away_o = rec["home_win"], rec["draw"], rec["away_win"]
@@ -132,13 +128,9 @@ def page_matches_and_bets():
 
             # 既存ベット（自分）
             my_key = f"{current_gw}__{user}__{mid}"
-            my_bet = None
-            for r in read_bets():
-                if r.get("key")==my_key:
-                    my_bet = r
-                    break
+            my_bet = next((r for r in read_bets() if r.get("key")==my_key), None)
 
-            # ピック 3分割
+            # ピックUI（3分割）
             cols = st.columns(3)
             with cols[0]:
                 pick_home = st.toggle(f"HOME WIN\n({m['home']})", value=(my_bet and my_bet.get("pick")=="H"), key=f"pickH_{mid}")
@@ -149,24 +141,19 @@ def page_matches_and_bets():
 
             # 排他化
             pick_val = None
-            if pick_home: 
-                pick_val = "H"
-                st.session_state[f"pickD_{mid}"] = False
-                st.session_state[f"pickA_{mid}"] = False
+            if pick_home:
+                pick_val = "H"; st.session_state[f"pickD_{mid}"]=False; st.session_state[f"pickA_{mid}"]=False
             elif pick_draw:
-                pick_val = "D"
-                st.session_state[f"pickH_{mid}"] = False
-                st.session_state[f"pickA_{mid}"] = False
+                pick_val = "D"; st.session_state[f"pickH_{mid}"]=False; st.session_state[f"pickA_{mid}"]=False
             elif pick_away:
-                pick_val = "A"
-                st.session_state[f"pickH_{mid}"] = False
-                st.session_state[f"pickD_{mid}"] = False
+                pick_val = "A"; st.session_state[f"pickH_{mid}"]=False; st.session_state[f"pickD_{mid}"]=False
 
             # ステーク
+            max_total = int(conf.get("max_total_stake_per_gw","5000"))
             default_stake = int(my_bet.get("stake")) if my_bet else stake_step*4
-            stake = st.number_input("ステーク", min_value=0, max_value=max_total, step=stake_step, value=default_stake, key=f"stake_{mid}", help="この試合に賭ける金額")
+            stake = st.number_input("ステーク", min_value=0, max_value=max_total, step=stake_step, value=default_stake, key=f"stake_{mid}")
 
-            # 他ユーザーのベット
+            # 他ユーザーのベット状況
             others = other_bets_for_match(mid, user)
             if others:
                 chips = " / ".join([f"**{o['user']}**: {o['pick']}×{o['stake']}" for o in others])
@@ -174,21 +161,15 @@ def page_matches_and_bets():
 
             disabled = match_locked or (pick_val is None) or (stake<=0)
             if st.button("この内容でベット", key=f"betbtn_{mid}", disabled=disabled):
-                # 上限チェック
                 already = user_total_stake_in_gw(user, current_gw) - (int(my_bet.get("stake")) if my_bet else 0)
                 if already + stake > max_total:
                     st.error("このGWの投票上限を超えます。金額を調整してください。")
                 else:
                     sel_odds = {"H":home_o, "D":draw_o, "A":away_o}.get(pick_val, 1.0)
                     upsert_bet(
-                        gw=current_gw,
-                        user=user,
-                        match_id=mid,
+                        gw=current_gw, user=user, match_id=mid,
                         match_label=f"{m['home']} vs {m['away']}",
-                        pick=pick_val,
-                        stake=int(stake),
-                        odds=float(sel_odds),
-                        status="placed"
+                        pick=pick_val, stake=int(stake), odds=float(sel_odds), status="placed"
                     )
                     st.success("ベットを記録しました！")
                     st.rerun()
@@ -202,10 +183,31 @@ def page_odds_admin():
         return
 
     st.markdown("### 🛠 オッズ管理")
-    matches, _ = fetch_matches_window(14, conf.get("API_FOOTBALL_LEAGUE_ID","39"), conf.get("API_FOOTBALL_SEASON","2025"))
+    st.caption("※必要時のみAPIを呼びます（遅延ロード）。")
+
+    # 読み込みトグル
+    do_fetch = st.button("7日以内の試合を読み込む")
+    matches = []
+    debug_url = ""
+    if do_fetch:
+        try:
+            matches, debug_url = fetch_matches_window(
+                7,
+                conf.get("API_FOOTBALL_LEAGUE_ID","39"),
+                conf.get("API_FOOTBALL_SEASON","2025")
+            )
+        except requests.HTTPError as e:
+            st.error("試合リスト取得に失敗しました。トークンや期間をご確認ください。")
+            with st.expander("詳細"):
+                st.code(e.response.text if getattr(e, "response", None) is not None else str(e))
+            return
+
     if not matches:
-        st.info("対象期間に試合がありません。")
+        st.info("『7日以内の試合を読み込む』を押すと現在の対戦が編集できます。")
         return
+
+    with st.expander("取得URL（デバッグ）", expanded=False):
+        st.code(debug_url, language="text")
 
     current_gw = conf.get("current_gw","GW?")
     odds_map = read_odds()
@@ -234,7 +236,7 @@ def page_odds_admin():
                 st.success("保存しました")
                 st.rerun()
 
-# ============ ヘッダ & ルーティング ============
+# ============ ルーティング ============
 def main():
     if need_login():
         show_login()
@@ -250,7 +252,6 @@ def main():
     with tabs[0]:
         st.markdown("## トップ")
         st.write(f"ようこそ **{user['username']}** さん！")
-
     with tabs[1]:
         page_matches_and_bets()
     with tabs[2]:
