@@ -1,99 +1,56 @@
-# football_api.py
-from __future__ import annotations
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, List, Optional
+from datetime import datetime, timedelta
+from typing import List, Dict, Tuple
+import os
 import requests
+import streamlit as st
 
-UTC = timezone.utc
-FD_BASE = "https://api.football-data.org/v4"
+BASE = "https://api.football-data.org/v4"
 
-class FDClient:
-    def __init__(self, token: str):
-        self.session = requests.Session()
-        self.session.headers.update({"X-Auth-Token": token})
+def _token() -> str:
+    # config から読む（app.py 側で read_config 済みならそちらを渡して使ってもOK）
+    from google_sheets_client import read_config
+    conf = read_config()
+    tok = conf.get("FOOTBALL_DATA_API_TOKEN") or conf.get("FOOTBALL_DATA_API_KEY") or ""
+    return tok.strip()
 
-    def get(self, path: str, params: dict) -> dict:
-        url = f"{FD_BASE}{path}"
-        r = self.session.get(url, params=params, timeout=20)
-        r.raise_for_status()
-        return r.json()
+def _headers():
+    return {"X-Auth-Token": _token()}
 
-def _iso_utc(dt: datetime) -> str:
-    return dt.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-def fetch_scheduled_between(
-    token: str,
-    competition: str,   # ← PL / 2021 など（football-data.org のID or code）
-    date_from: datetime,
-    date_to: datetime,
-    season: Optional[str] = None,
-) -> dict:
+def fetch_matches_window(days: int, competition_id: str, season: str) -> Tuple[List[Dict], str]:
     """
-    football-data.org の対戦を期間指定で取得
+    football-data v4 /matches を competitions=ID で叩く（これが 404 を避ける安定形）
     """
-    cli = FDClient(token)
+    today = datetime.utcnow().date()
+    date_from = today
+    date_to = today + timedelta(days=days)
+
     params = {
-        "dateFrom": date_from.date().isoformat(),
-        "dateTo": date_to.date().isoformat(),
+        "dateFrom": date_from.isoformat(),
+        "dateTo": date_to.isoformat(),
+        "competitions": str(competition_id),
         "status": "SCHEDULED",
+        "season": str(season)
     }
-    if season:
-        params["season"] = season
+    url = f"{BASE}/matches"
+    r = requests.get(url, headers=_headers(), params=params, timeout=20)
+    r.raise_for_status()
+    js = r.json()
+    matches = js.get("matches", [])
 
-    data = cli.get(f"/competitions/{competition}/matches", params)
-    return data
-
-def fetch_next_round_fd(
-    token: str,
-    competition: str,
-    season: str,
-    horizon_days: int = 21,
-) -> dict:
-    """
-    直近のSCHEDULED試合から“最も早いキックオフ日時”のラウンド(=GW)を特定し、
-    そのラウンドに属する試合だけを返す。
-    返却: {"matchday": <GW>, "earliest_utc": datetime, "fixtures": [ ... ]}
-    """
-    now = datetime.now(UTC)
-    date_from = now
-    date_to = now + timedelta(days=horizon_days)
-
-    raw = fetch_scheduled_between(
-        token=token,
-        competition=competition,
-        date_from=date_from,
-        date_to=date_to,
-        season=season,
-    )
-
-    matches: List[dict] = raw.get("matches") or []
-    if not matches:
-        return {"matchday": None, "earliest_utc": None, "fixtures": []}
-
-    # 最も早いキックオフ（UTC）
-    def ko_utc(m: dict) -> datetime:
-        # APIはZつきISO。strptimeでUTCに。
-        return datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00")).astimezone(UTC)
-
-    matches_sorted = sorted(matches, key=ko_utc)
-    earliest = matches_sorted[0]
-    earliest_utc = ko_utc(earliest)
-    target_round = earliest.get("matchday") or earliest.get("season", {}).get("currentMatchday")
-
-    # 同じ round のみ抽出
-    same_round = [m for m in matches_sorted if (m.get("matchday") == target_round)]
-
-    fixtures = []
-    for m in same_round:
-        fixtures.append({
-            "match_id": str(m["id"]),
-            "utc": ko_utc(m).isoformat(),
-            "home": m["homeTeam"]["shortName"] or m["homeTeam"]["name"],
-            "away": m["awayTeam"]["shortName"] or m["awayTeam"]["name"],
+    # 必要情報だけ整形
+    out = []
+    for m in matches:
+        mid = str(m.get("id"))
+        home = m.get("homeTeam", {}).get("name", "")
+        away = m.get("awayTeam", {}).get("name", "")
+        utc = m.get("utcDate")
+        out.append({
+            "match_id": mid,
+            "utcDate": utc,
+            "home": home,
+            "away": away,
+            "gw": ""  # GW 表示は app 側で current_gw を使う
         })
 
-    return {
-        "matchday": target_round,
-        "earliest_utc": earliest_utc,
-        "fixtures": fixtures,
-    }
+    debug = f"{url}?dateFrom={params['dateFrom']}&dateTo={params['dateTo']}&competitions={competition_id}&status=SCHEDULED&season={season}"
+    return out, debug
