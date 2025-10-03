@@ -1,59 +1,49 @@
 from __future__ import annotations
-from typing import Dict, Any, List, Optional, Tuple
-import streamlit as st
+import datetime as dt
 import requests
-from datetime import datetime, timedelta, timezone
+from typing import Dict, Any, List
+import streamlit as st
 
-API_BASE = "https://api.football-data.org/v4"  # v4推奨
-
-def _headers(token: str) -> Dict[str, str]:
+def _fd_headers(token: str) -> Dict[str, str]:
     return {"X-Auth-Token": token}
 
-def _tok(conf: Dict[str, str]) -> str:
-    tok = conf.get("FOOTBALL_DATA_API_TOKEN","").strip()
-    if not tok:
-        raise RuntimeError("FOOTBALL_DATA_API_TOKEN が config にありません。")
-    return tok
+def _normalize_comp(v: str) -> str:
+    if not v:
+        return "PL"
+    v = str(v).strip().upper()
+    if v == "39":     # API-Footballの名残り救済
+        return "PL"
+    if v in ("PL", "2021"):  # football-data のPLコード or ID
+        return v
+    return v
 
-def get_timezone(conf: Dict[str, str]) -> timezone:
-    # football-data はUTCを返すため、表示側だけJSTなどに寄せたい時の便宜関数
-    return timezone(timedelta(hours=9))  # Asia/Tokyo 固定でOK
-
-def fixtures_by_date_range(conf: Dict[str,str], league_id: str, date_from: datetime, date_to: datetime) -> List[Dict[str, Any]]:
-    """指定期間の試合（リーグ絞り）を取得。最大30日幅を想定。"""
-    token = _tok(conf)
+def fetch_fixtures_fd(conf: Dict[str, str], days_ahead: int) -> Dict[str, Any]:
+    token = conf.get("FOOTBALL_DATA_API_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("FOOTBALL_DATA_API_TOKEN が未設定です。（config シート）")
+    comp = _normalize_comp(conf.get("FOOTBALL_DATA_COMPETITION", "PL"))
+    today = dt.datetime.utcnow().date()
     params = {
-        "dateFrom": date_from.strftime("%Y-%m-%d"),
-        "dateTo":   date_to.strftime("%Y-%m-%d"),
-        "competitions": league_id
+        "dateFrom": today.isoformat(),
+        "dateTo": (today + dt.timedelta(days=int(days_ahead))).isoformat(),
+        "competitions": comp,
     }
-    url = f"{API_BASE}/matches"
-    r = requests.get(url, headers=_headers(token), params=params, timeout=20)
-    if r.status_code == 403:
-        raise RuntimeError("football-data.org 403: トークン/プラン権限を確認してください。")
+    url = "https://api.football-data.org/v4/matches"
+    r = requests.get(url, headers=_fd_headers(token), params=params, timeout=20)
     r.raise_for_status()
-    data = r.json()
-    return data.get("matches", [])
+    return r.json()
 
-def team_name(t: Dict[str,Any]) -> str:
-    return t.get("shortName") or t.get("name") or ""
-
-def simplify_match(m: Dict[str,Any]) -> Dict[str,Any]:
-    mid   = m.get("id")
-    utc   = m.get("utcDate")
-    comp  = m.get("competition", {}).get("name", "")
-    home  = team_name(m.get("homeTeam", {}))
-    away  = team_name(m.get("awayTeam", {}))
-    score = m.get("score", {})
-    full  = score.get("fullTime", {})
-    status = m.get("status","")
-    return {
-        "match_id": mid,
-        "utcDate": utc,
-        "competition": comp,
-        "home": home,
-        "away": away,
-        "status": status,
-        "home_ft": full.get("home"),
-        "away_ft": full.get("away"),
-    }
+def simplify_matches(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out = []
+    for m in raw.get("matches", []):
+        out.append({
+            "id": m.get("id"),
+            "utc": m.get("utcDate"),
+            "status": m.get("status"),
+            "home": m.get("homeTeam", {}).get("name"),
+            "away": m.get("awayTeam", {}).get("name"),
+            "score": m.get("score", {}),
+            "stage": m.get("stage"),
+            "matchday": m.get("matchday"),
+        })
+    return out
