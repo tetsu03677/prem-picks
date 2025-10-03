@@ -1,61 +1,99 @@
 # football_api.py
 from __future__ import annotations
-import os
-import requests
 from datetime import datetime, timedelta, timezone
+from typing import Dict, Any, List, Optional
+import requests
 
-TZ_UTC = timezone.utc
+UTC = timezone.utc
 FD_BASE = "https://api.football-data.org/v4"
 
-def _headers_fd(api_token: str):
-    return {"X-Auth-Token": api_token}
+class FDClient:
+    def __init__(self, token: str):
+        self.session = requests.Session()
+        self.session.headers.update({"X-Auth-Token": token})
 
-def _iso_to_dt(s: str) -> datetime:
-    # football-data は ISO8601（末尾Z）なので UTC として解釈
-    return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(TZ_UTC)
+    def get(self, path: str, params: dict) -> dict:
+        url = f"{FD_BASE}{path}"
+        r = self.session.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        return r.json()
 
-def fetch_next_round_fd(api_token: str, league_id: str | int, season: str | int):
+def _iso_utc(dt: datetime) -> str:
+    return dt.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+def fetch_scheduled_between(
+    token: str,
+    competition: str,   # ← PL / 2021 など（football-data.org のID or code）
+    date_from: datetime,
+    date_to: datetime,
+    season: Optional[str] = None,
+) -> dict:
     """
-    次に来るラウンド（matchday=GW）をまとめて返す。
-    - まず今から+30日までのSCHEDULEDを取得
-    - 最も早い試合の matchday を次節とみなし、その matchday の試合を全部返す
+    football-data.org の対戦を期間指定で取得
     """
-    url = f"{FD_BASE}/competitions/{league_id}/matches"
-    # 余裕をもって30日先まで取得してから「次のGW」を切り出す
-    today = datetime.now(TZ_UTC).date()
+    cli = FDClient(token)
     params = {
-        "season": str(season),
-        "dateFrom": today.isoformat(),
-        "dateTo": (today + timedelta(days=30)).isoformat(),
+        "dateFrom": date_from.date().isoformat(),
+        "dateTo": date_to.date().isoformat(),
         "status": "SCHEDULED",
     }
-    r = requests.get(url, headers=_headers_fd(api_token), params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
+    if season:
+        params["season"] = season
 
-    matches = data.get("matches", [])
+    data = cli.get(f"/competitions/{competition}/matches", params)
+    return data
+
+def fetch_next_round_fd(
+    token: str,
+    competition: str,
+    season: str,
+    horizon_days: int = 21,
+) -> dict:
+    """
+    直近のSCHEDULED試合から“最も早いキックオフ日時”のラウンド(=GW)を特定し、
+    そのラウンドに属する試合だけを返す。
+    返却: {"matchday": <GW>, "earliest_utc": datetime, "fixtures": [ ... ]}
+    """
+    now = datetime.now(UTC)
+    date_from = now
+    date_to = now + timedelta(days=horizon_days)
+
+    raw = fetch_scheduled_between(
+        token=token,
+        competition=competition,
+        date_from=date_from,
+        date_to=date_to,
+        season=season,
+    )
+
+    matches: List[dict] = raw.get("matches") or []
     if not matches:
-        return {"fixtures": [], "earliest_utc": None, "matchday": None}
+        return {"matchday": None, "earliest_utc": None, "fixtures": []}
 
-    # 一番早い試合を探す
-    matches_sorted = sorted(matches, key=lambda m: _iso_to_dt(m["utcDate"]))
-    first = matches_sorted[0]
-    next_md = first.get("matchday") or first.get("season", {}).get("currentMatchday")
-    # 同じ matchday の試合をまとめる
-    gw_fixtures = [m for m in matches_sorted if m.get("matchday") == next_md]
+    # 最も早いキックオフ（UTC）
+    def ko_utc(m: dict) -> datetime:
+        # APIはZつきISO。strptimeでUTCに。
+        return datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00")).astimezone(UTC)
+
+    matches_sorted = sorted(matches, key=ko_utc)
+    earliest = matches_sorted[0]
+    earliest_utc = ko_utc(earliest)
+    target_round = earliest.get("matchday") or earliest.get("season", {}).get("currentMatchday")
+
+    # 同じ round のみ抽出
+    same_round = [m for m in matches_sorted if (m.get("matchday") == target_round)]
 
     fixtures = []
-    for m in gw_fixtures:
+    for m in same_round:
         fixtures.append({
-            "match_id": m["id"],
-            "home": m["homeTeam"]["name"],
-            "away": m["awayTeam"]["name"],
-            "utc": _iso_to_dt(m["utcDate"]).isoformat(),
-            "matchday": m.get("matchday"),
+            "match_id": str(m["id"]),
+            "utc": ko_utc(m).isoformat(),
+            "home": m["homeTeam"]["shortName"] or m["homeTeam"]["name"],
+            "away": m["awayTeam"]["shortName"] or m["awayTeam"]["name"],
         })
 
     return {
+        "matchday": target_round,
+        "earliest_utc": earliest_utc,
         "fixtures": fixtures,
-        "earliest_utc": _iso_to_dt(first["utcDate"]),
-        "matchday": next_md,
     }
