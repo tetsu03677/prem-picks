@@ -17,7 +17,7 @@ from football_api import (
 )
 
 # ------------------------------------------------------------
-# スタイル（アイコンは使わない・落ち着いた最小限） ← 余白だけ調整
+# スタイル（※ログインカードの枠線を安全に除去）
 # ------------------------------------------------------------
 CSS = """
 <style>
@@ -28,14 +28,15 @@ CSS = """
   .stTabs [role="tablist"]{margin-top:.25rem}
 }
 
-/* 既存のUI */
-.app-card{border:1px solid rgba(120,120,120,.25); border-radius:10px; padding:18px; background:rgba(255,255,255,.02);}
+/* UI */
+.app-card{border:none; border-radius:10px; padding:18px; background:rgba(255,255,255,.02);}
 .subtle{color:rgba(255,255,255,.6); font-size:.9rem}
 .kpi-row{display:flex; gap:12px; flex-wrap:wrap}
 .kpi{flex:1 1 140px; border:1px solid rgba(120,120,120,.25); border-radius:10px; padding:10px 14px}
 .kpi .h{font-size:.8rem; color:rgba(255,255,255,.55)}
 .kpi .v{font-size:1.3rem; font-weight:700; margin-top:2px}
 .section{margin:16px 0 10px}
+.badge{display:inline-block; padding:.2rem .55rem; border:1px solid rgba(120,120,120,.25); border-radius:999px; margin:.15rem .25rem .15rem 0;}
 table {width:100%}
 .login-hidden {display:none}
 </style>
@@ -141,13 +142,57 @@ def gw_and_lock_state(conf: Dict[str, str], matches: List[Dict]) -> Tuple[str, b
     return gw_name, locked, lock_at_utc
 
 # ------------------------------------------------------------
-# UI: トップ
+# UI: トップ（★追加：次節の紹介＋収支ランキング）
 # ------------------------------------------------------------
 def page_home(conf: Dict[str, str], me: Dict):
     st.markdown("## トップ")
     st.info("ここでは簡単なガイドだけを表示。実際の操作は上部タブから。")
     if me:
         st.caption(f"ログイン中： {me['username']} ({me.get('role','')})")
+
+    # ① 次節のブックメーカー役とプレイヤー紹介
+    users = get_users(conf)
+    bm = (conf.get("bookmaker_username") or "").strip()
+    players = [u["username"] for u in users if u.get("username") != bm]
+    players.sort()
+
+    st.markdown('<div class="section">次節のメンバー</div>', unsafe_allow_html=True)
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        st.markdown(f'<div class="kpi"><div class="h">ブックメーカー</div><div class="v">{bm if bm else "-"}</div></div>', unsafe_allow_html=True)
+    with c2:
+        if players:
+            p_html = " ".join([f'<span class="badge">{p}</span>' for p in players])
+            st.markdown(f'<div class="kpi"><div class="h">プレイヤー</div><div>{p_html}</div></div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="kpi"><div class="h">プレイヤー</div><div class="subtle">-</div></div>', unsafe_allow_html=True)
+
+    # ② いま時点のユーザー収支ランキング（確定済みのみ）
+    bets = read_rows_by_sheet("bets")
+    settled = [b for b in bets if (b.get("result") or "").upper() in ("WIN", "LOSE")]
+    by_user = {}
+    for b in settled:
+        u = b.get("user", "")
+        by_user.setdefault(u, {"stake": 0, "payout": 0.0})
+        by_user[u]["stake"] += parse_int(b.get("stake", 0))
+        by_user[u]["payout"] += parse_float(b.get("payout"), 0.0) or 0.0
+
+    ranking = []
+    for u, v in by_user.items():
+        net = v["payout"] - v["stake"]
+        ranking.append({"ユーザー": u, "収支(net)": net, "支出(stake)": v["stake"], "収入(payout)": v["payout"]})
+    ranking.sort(key=lambda r: (-r["収支(net)"], r["ユーザー"]))
+
+    st.markdown('<div class="section">ユーザー別 収支ランキング（確定ベットのみ集計）</div>', unsafe_allow_html=True)
+    if ranking:
+        # ランキングを軽量テーブルで表示（データフレームは使わない）
+        header = "| 順位 | ユーザー | 収支(net) | 支出(stake) | 収入(payout) |\n|---:|---|---:|---:|---:|"
+        lines = [header]
+        for i, r in enumerate(ranking, start=1):
+            lines.append(f"| {i} | {r['ユーザー']} | {r['収支(net)']:.2f} | {r['支出(stake)']:,} | {r['収入(payout)']:.2f} |")
+        st.markdown("\n".join(lines))
+    else:
+        st.caption("　まだ確定済みのベットがありません。")
 
 # ------------------------------------------------------------
 # UI: 試合とベット
