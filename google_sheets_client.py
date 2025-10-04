@@ -7,14 +7,11 @@ import gspread
 from google.oauth2.service_account import Credentials
 import streamlit as st
 
-# ───────────────────────────────
-# 接続ユーティリティ
-# ───────────────────────────────
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 JST = timezone(timedelta(hours=9))
 
+# 1→A, 26→Z, 27→AA...
 def _col_label(n: int) -> str:
-    """1→A, 26→Z, 27→AA ..."""
     s = ""
     while n > 0:
         n, r = divmod(n-1, 26)
@@ -23,7 +20,7 @@ def _col_label(n: int) -> str:
 
 @st.cache_resource(show_spinner=False)
 def _client():
-    info = st.secrets["gcp_service_account"]
+    info = st.secrets["gcp_service_account"]  # secrets.toml に service account を設定
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     gc = gspread.Client(auth=creds)
     gc.session = gspread.auth.AuthorizedSession(creds)
@@ -31,16 +28,13 @@ def _client():
 
 @st.cache_resource(show_spinner=False)
 def _spreadsheet():
-    ssid = st.secrets["sheets"]["sheet_id"]
+    ssid = st.secrets["sheets"]["sheet_id"]   # スプレッドシートID
     gc = _client()
     return gc.open_by_key(ssid)
 
 def ws(name: str):
     return _spreadsheet().worksheet(name)
 
-# ───────────────────────────────
-# config 読み込み
-# ───────────────────────────────
 @st.cache_data(ttl=60, show_spinner=False)
 def read_rows_by_sheet(sheet_name: str) -> List[Dict]:
     try:
@@ -51,32 +45,24 @@ def read_rows_by_sheet(sheet_name: str) -> List[Dict]:
 @st.cache_data(ttl=60, show_spinner=False)
 def read_config() -> Dict[str, str]:
     rows = read_rows_by_sheet("config")
-    conf = {}
+    conf: Dict[str, str] = {}
     for r in rows:
         k = str(r.get("key", "")).strip()
         v = str(r.get("value", "")).strip()
         if k:
             conf[k] = v
-    # football_api 側で参照できるようにキャッシュに一部保持
+    # football_api で利用するため保持
     st.session_state["_conf_cache"] = conf
     return conf
 
-# ───────────────────────────────
-# bets 読み書き
-# ───────────────────────────────
 def _find_row_idx_by_keys(sheet, keys: Dict[str, str|int]) -> int | None:
-    """指定カラム群の一致で行番号（1始まり）を返す。ヘッダは1行目なので2行目=データの先頭"""
     rows = sheet.get_all_records()
-    for i, r in enumerate(rows, start=2):
-        hit = True
-        for k, v in keys.items():
-            if str(r.get(k)) != str(v):
-                hit = False
-                break
-        if hit:
+    for i, r in enumerate(rows, start=2):  # 2=データ先頭（1行目はヘッダ）
+        if all(str(r.get(k)) == str(v) for k, v in keys.items()):
             return i
     return None
 
+# ---- bets ----
 def upsert_bet_row(gw: int, match_id: int, username: str, match: str, pick: str, stake: int, odds: float):
     sheet = ws("bets")
     keys = {"gw": gw, "match_id": match_id, "user": username}
@@ -111,9 +97,7 @@ def list_bets_by_gw(gw: int) -> List[Dict]:
     rows = read_rows_by_sheet("bets")
     return [r for r in rows if str(r.get("gw")) == str(gw)]
 
-# ───────────────────────────────
-# odds 読み書き
-# ───────────────────────────────
+# ---- odds ----
 def upsert_odds_row(gw: int, match_id: int, home_team: str, away_team: str, home_win: float, draw: float, away_win: float):
     sheet = ws("odds")
     keys = {"gw": gw, "match_id": match_id}
