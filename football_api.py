@@ -1,98 +1,100 @@
+from __future__ import annotations
 from datetime import datetime, timedelta, timezone
-from dateutil import tz
+from typing import Dict, List, Tuple, Optional
+
 import requests
 import streamlit as st
 
-FD_BASE = "https://api.football-data.org/v4"
+def _api_token(conf: Dict) -> str:
+    # config を優先。なければ secrets
+    t = conf.get("FOOTBALL_DATA_API_TOKEN") or st.secrets.get("FOOTBALL_DATA_API_TOKEN", "")
+    return str(t)
 
-def _headers(conf: dict):
-    return {"X-Auth-Token": conf.get("FOOTBALL_DATA_API_TOKEN", "").strip()}
+def _headers(token: str) -> Dict:
+    return {"X-Auth-Token": token}
 
-def _competition_param(conf: dict):
-    return conf.get("FOOTBALL_DATA_COMPETITION", "PL").strip()
-
-def _season_param(conf: dict):
-    return str(conf.get("FOOTBALL_DATA_SEASON", "2025")).strip()
-
-@st.cache_data(show_spinner=False, ttl=60)
-def fetch_matches_window(day_window: int, competition: str, season: str, conf: dict):
-    now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
-    date_from = now_utc.date().isoformat()
-    date_to = (now_utc + timedelta(days=day_window)).date().isoformat()
-
-    url = f"{FD_BASE}/matches"
-    params = {"competitions": competition, "dateFrom": date_from, "dateTo": date_to, "season": season}
-    r = requests.get(url, headers=_headers(conf), params=params, timeout=30)
+def fetch_matches_window(day_window: int, competition: str, season: str, token: str) -> List[Dict]:
+    now = datetime.now(timezone.utc)
+    date_from = now.date().isoformat()
+    date_to = (now + timedelta(days=day_window)).date().isoformat()
+    url = f"https://api.football-data.org/v4/matches"
+    params = {"dateFrom": date_from, "dateTo": date_to, "competitions": competition}
+    r = requests.get(url, headers=_headers(token), params=params, timeout=30)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    matches = data.get("matches", [])
+    # フィルタ：シーズン一致のみ
+    if season:
+        matches = [m for m in matches if str(m.get("season",{}).get("startDate","")).startswith(season[:4]) or str(m.get("season",{}).get("currentMatchday",""))]
+    return matches
 
-def _parse_gw(m: dict):
-    md = m.get("matchday")
-    return f"GW{md}" if md else "GW?"
+def fetch_matches_next_gw(conf: Dict, day_window: int = 7) -> Tuple[List[Dict], Optional[str]]:
+    token = _api_token(conf)
+    comp = str(conf.get("FOOTBALL_DATA_COMPETITION", "PL"))
+    season = str(conf.get("API_FOOTBALL_SEASON", ""))
 
-def simplify_matches(api_json: dict, tzinfo):
+    window = fetch_matches_window(day_window, comp, season, token)
+    if not window:
+        return [], None
+    # 最初に来る matchday を次節とみなして同一 matchday を抽出
+    md = None
+    for m in sorted(window, key=lambda x: x.get("utcDate","")):
+        md = m.get("matchday") or m.get("season",{}).get("currentMatchday")
+        if md:
+            break
+    if md is None:
+        return [], None
+    gw = f"GW{int(md)}"
+    next_matches = [m for m in window if (m.get("matchday") or m.get("season",{}).get("currentMatchday")) == md]
+    return next_matches, gw
+
+def simplify_matches(matches: List[Dict], tz) -> List[Dict]:
     out = []
-    for m in api_json.get("matches", []):
-        utc_str = m.get("utcDate")
-        try:
-            utc_dt = datetime.fromisoformat(utc_str.replace("Z","+00:00")).astimezone(timezone.utc)
-        except Exception:
-            continue
-        local_dt = utc_dt.astimezone(tzinfo or tz.gettz("Asia/Tokyo"))
+    for m in sorted(matches, key=lambda x: x.get("utcDate","")):
+        utc_dt = datetime.fromisoformat(m["utcDate"].replace("Z","+00:00"))
         out.append({
-            "id": m.get("id"),
-            "gw": _parse_gw(m),
+            "id": int(m["id"]),
+            "gw": f"GW{int(m.get('matchday') or 0)}" if m.get("matchday") else "GW",
             "utc_kickoff": utc_dt,
-            "local_kickoff": local_dt,
-            "home": (m.get("homeTeam") or {}).get("name",""),
-            "away": (m.get("awayTeam") or {}).get("name",""),
-            "status": m.get("status",""),
-            "score": m.get("score", {}),
+            "local_kickoff": utc_dt.astimezone(tz),
+            "home": m.get("homeTeam",{}).get("name",""),
+            "away": m.get("awayTeam",{}).get("name",""),
+            "status": m.get("status","")
         })
-    out.sort(key=lambda x: x["utc_kickoff"])
     return out
 
-def compute_gw_lock_threshold(matches: list, conf: dict, tzinfo):
-    if not matches:
+def fetch_match_results_for_ids(conf: Dict, match_ids: List[int], realtime: bool=False, finished_only: bool=False) -> Dict[int, Dict]:
+    """match_id -> {'home':score, 'away':score, 'status':...}"""
+    token = _api_token(conf)
+    out = {}
+    for mid in match_ids:
+        url = f"https://api.football-data.org/v4/matches/{mid}"
+        r = requests.get(url, headers=_headers(token), timeout=30)
+        if r.status_code != 200:
+            continue
+        m = r.json().get("match", r.json())
+        status = m.get("status","")
+        if finished_only and status != "FINISHED":
+            continue
+        score = m.get("score",{})
+        full = score.get("fullTime",{}) or {}
+        # リアルタイム時は live/halfTime を優先
+        if realtime:
+            live = score.get("live",{}) or score.get("halfTime",{}) or full
+            full = live or full
+        out[int(mid)] = {
+            "home": int(full.get("home", 0) or 0),
+            "away": int(full.get("away", 0) or 0),
+            "status": status
+        }
+    return out
+
+def outcome_from_score(score: Optional[Dict]) -> Optional[str]:
+    if not score:
         return None
-    first_utc = min(m["utc_kickoff"] for m in matches)
-    minutes = int(conf.get("odds_freeze_minutes_before_first", "120") or 120)
-    return first_utc - timedelta(minutes=minutes)
-
-def _first_gw_label(matches: list, fallback: str):
-    for m in matches:
-        if m.get("gw"):
-            return m["gw"]
-    return fallback
-
-def fetch_matches_current_gw(conf: dict, day_window: int = 7):
-    comp = _competition_param(conf)
-    season = _season_param(conf)
-    js = fetch_matches_window(day_window, comp, season, conf)
-    tzinfo = tz.gettz(conf.get("timezone", "Asia/Tokyo"))
-    ms = simplify_matches(js, tzinfo)
-    gw = _first_gw_label(ms, conf.get("current_gw", "GW?"))
-    return js, gw
-
-@st.cache_data(show_spinner=False, ttl=60)
-def fetch_matches_next_gw(conf: dict, day_window: int = 7):
-    comp = _competition_param(conf)
-    season = _season_param(conf)
-    js = fetch_matches_window(day_window, comp, season, conf)
-    tzinfo = tz.gettz(conf.get("timezone", "Asia/Tokyo"))
-    ms = simplify_matches(js, tzinfo)
-    if not ms:
-        return {"matches": []}, "GW?"
-    first_gw = _first_gw_label(ms, "GW?")
-    return {"matches": [m for m in js.get("matches", []) if _parse_gw(m)==first_gw]}, first_gw
-
-@st.cache_data(show_spinner=False, ttl=45)
-def fetch_match_snapshots_by_ids(conf: dict, ids: list[str]):
-    if not ids:
-        return []
-    url = f"{FD_BASE}/matches"
-    params = {"ids": ",".join(ids)}
-    r = requests.get(url, headers=_headers(conf), params=params, timeout=30)
-    r.raise_for_status()
-    js = r.json()
-    return js.get("matches", [])
+    h, a = int(score.get("home",0)), int(score.get("away",0))
+    if h > a:
+        return "HOME"
+    if a > h:
+        return "AWAY"
+    return "DRAW"
