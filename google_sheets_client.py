@@ -1,115 +1,101 @@
 import json
 import time
-from typing import List, Dict, Any, Optional
+from typing import Dict, List, Any, Optional
 
-import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
+import streamlit as st
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# ---- low level --------------------------------------------------------------
-@st.cache_resource(show_spinner=False)
-def _client():
+def _client() -> gspread.Client:
+    # Secrets からサービスアカウント情報を読む（\n を含んだ鍵にも対応）
     info = dict(st.secrets["gcp_service_account"])
+    # safety: private_key は toml で \n を含む。余計な置換はしないが、改行無しで入った場合もケア
+    pk = info.get("private_key", "")
+    if "\\n" in pk and "\n" not in pk:
+        info["private_key"] = pk.replace("\\n", "\n")
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     return gspread.authorize(creds)
 
 @st.cache_resource(show_spinner=False)
-def _spreadsheet():
-    gc = _client()
-    ssid = st.secrets["sheets"]["sheet_id"]
-    return gc.open_by_key(ssid)
-
 def ws(sheet_name: str):
-    return _spreadsheet().worksheet(sheet_name)
+    gc = _client()
+    sh = gc.open_by_key(st.secrets["sheets"]["sheet_id"])
+    return sh.worksheet(sheet_name)
 
-# ---- utilities --------------------------------------------------------------
-def _records(sh) -> List[Dict[str, Any]]:
-    """worksheet → list of records (first row is header). 空シートは [] を返す"""
-    vals = sh.get_all_values()
-    if not vals:
-        return []
-    header = vals[0]
-    recs = []
-    for row in vals[1:]:
-        item = {header[i]: (row[i] if i < len(row) else "") for i in range(len(header))}
-        if any(v != "" for v in item.values()):
-            recs.append(item)
-    return recs
+def _records(worksheet) -> List[Dict[str, Any]]:
+    # 先頭行をヘッダとして records を返す
+    return worksheet.get_all_records()
 
 def read_rows_by_sheet(sheet_name: str) -> List[Dict[str, Any]]:
     return _records(ws(sheet_name))
 
 def read_config() -> Dict[str, str]:
-    cfg_rows = read_rows_by_sheet("config")
-    cfg = {r.get("key", ""): r.get("value", "") for r in cfg_rows if r.get("key")}
-    return cfg
+    rows = read_rows_by_sheet("config")
+    kv = {}
+    for r in rows:
+        k = str(r.get("key", "")).strip()
+        v = str(r.get("value", "")).strip()
+        if k:
+            kv[k] = v
+    return kv
 
-def parse_users_from_config(cfg: Dict[str, str]) -> List[Dict[str, Any]]:
-    raw = cfg.get("users_json", "").strip()
-    if not raw:
-        return []
-    try:
-        users = json.loads(raw)
-        # normalize fields / minimal validation
-        norm = []
-        for u in users:
-            norm.append({
-                "username": str(u.get("username", "")).strip(),
-                "password": str(u.get("password", "")).strip(),
-                "role": (u.get("role") or "user").strip(),
-                "team": (u.get("team") or "").strip(),
-            })
-        # remove empty usernames / duplicates by last one wins
-        uniq = {}
-        for u in norm:
-            if u["username"]:
-                uniq[u["username"]] = u
-        return list(uniq.values())
-    except Exception:
-        return []
-
-def upsert_row(sheet_name: str, key_col: str, key_value: str, payload: Dict[str, Any]) -> None:
-    """key_col の値で行を探し、あれば更新、無ければ末尾に追加"""
-    sh = ws(sheet_name)
-    rows = sh.get_all_records()
-    headers = sh.row_values(1)
-    if key_col not in headers:
-        # 1 行目にヘッダがない場合は作る
-        if not headers:
-            headers = list(payload.keys())
-            sh.append_row(headers)
-        else:
-            headers.append(key_col)
-            for k in payload.keys():
-                if k not in headers:
-                    headers.append(k)
-            sh.update("1:1", [headers])
-    # map index
-    key_idx = headers.index(key_col) + 1
-    found_row = None
-    for i, row in enumerate(rows, start=2):
-        if str(row.get(key_col, "")) == str(key_value):
-            found_row = i
+def upsert_row(sheet_name: str, key_field: str, key_value: Any, row_data: Dict[str, Any]) -> None:
+    """key_field 列の一致で upsert（odds/bets 管理に使用）"""
+    w = ws(sheet_name)
+    headers = w.row_values(1)
+    key_col_idx = headers.index(key_field) + 1
+    # 全データを取って該当行を探す
+    all_vals = w.get_all_values()
+    target_row = None
+    for i in range(2, len(all_vals) + 1):
+        if str(w.cell(i, key_col_idx).value) == str(key_value):
+            target_row = i
             break
-    # align values by header order
-    row_values = []
-    for h in headers:
-        row_values.append(payload.get(h, "" if h != key_col else key_value))
-    if found_row:
-        sh.update(f"{found_row}:{found_row}", [row_values])
+    # ヘッダ↔値の並びで row_values を作る
+    values_row = [row_data.get(h, "") for h in headers]
+    if target_row is None:
+        # 末尾に追加
+        w.append_row(values_row)
     else:
-        sh.append_row(row_values, value_input_option="USER_ENTERED")
+        # 既存行を更新
+        rng = gspread.utils.rowcol_to_a1(target_row, 1) + ":" + gspread.utils.rowcol_to_a1(target_row, len(headers))
+        w.update(rng, [values_row])
 
-def read_bets() -> List[Dict[str, Any]]:
-    try:
-        return read_rows_by_sheet("bets")
-    except Exception:
-        return []
+def append_row(sheet_name: str, row_data: Dict[str, Any]) -> None:
+    w = ws(sheet_name)
+    headers = w.row_values(1)
+    values_row = [row_data.get(h, "") for h in headers]
+    w.append_row(values_row)
 
-def read_odds() -> List[Dict[str, Any]]:
-    try:
-        return read_rows_by_sheet("odds")
-    except Exception:
-        return []
+def read_odds_map_by_match_id(gw: str) -> Dict[str, Dict[str, Any]]:
+    """odds シートから当該 GW のレコードを match_id -> row dict で返す"""
+    odds_rows = read_rows_by_sheet("odds")
+    m = {}
+    for r in odds_rows:
+        if str(r.get("gw","")).strip() == str(gw).strip():
+            mid = str(r.get("match_id","")).strip()
+            if mid:
+                m[mid] = r
+    return m
+
+def upsert_odds(gw: str, match_id: str, home: str, draw: str, away: str, locker: str) -> None:
+    data = {
+        "gw": gw,
+        "match_id": match_id,
+        "home": home,
+        "away": "",  # シートの見出し順に合わせる
+        "home_win": home,    # 互換
+        "draw": draw,
+        "away_win": away,
+        "locked": "",
+        "updated_at": locker,
+    }
+    # odds シートの見出しが [gw,match_id,home,away,home_win,draw,away_win,locked,updated_at] の想定
+    # upsert は match_id で行う
+    upsert_row("odds", "match_id", match_id, data)
+
+def upsert_bet(row: Dict[str, Any]) -> None:
+    """bets シートに key で upsert。 key は {gw}-{user}-{match_id}"""
+    upsert_row("bets", "key", row["key"], row)
