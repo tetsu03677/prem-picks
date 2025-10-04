@@ -21,7 +21,9 @@ from football_api import (
 # ------------------------------------------------------------
 CSS = """
 <style>
-.block-container {padding-top:1.5rem; padding-bottom:3rem;}
+/* ← タブ上部が切れないように上マージンを増量 */
+.block-container {padding-top:3.2rem; padding-bottom:3rem;}
+
 .app-card{border:1px solid rgba(120,120,120,.25); border-radius:10px; padding:18px; background:rgba(255,255,255,.02);}
 .subtle{color:rgba(255,255,255,.6); font-size:.9rem}
 .kpi-row{display:flex; gap:12px; flex-wrap:wrap}
@@ -31,6 +33,16 @@ CSS = """
 .section{margin:16px 0 10px}
 table {width:100%}
 .login-hidden {display:none}
+
+/* トップの3分割カード（BM=赤、その他=グレー） */
+.role-cards{display:flex; gap:12px; flex-wrap:wrap}
+.role-card{flex:1 1 0; min-width:120px; border:1px solid rgba(120,120,120,.25); border-radius:12px; padding:12px 14px; background:rgba(255,255,255,.02)}
+.role-card.bm{border-color:rgba(255,0,0,.35); background:rgba(255,0,0,.08)}
+.role-card .name{font-weight:700; font-size:1.05rem}
+.role-card .role{font-size:.9rem; color:rgba(255,255,255,.7)}
+.badges{display:flex; gap:8px; flex-wrap:wrap; margin-top:6px}
+.badge{display:inline-block; padding:3px 8px; border-radius:999px; font-size:.85rem;
+       border:1px solid rgba(120,120,120,.25); background:rgba(255,255,255,.06)}
 </style>
 """
 st.set_page_config(page_title="Premier Picks", layout="wide")
@@ -57,7 +69,6 @@ def parse_float(x, default=None):
 def _gw_sort_key(x):
     """GWの並び替え用：GW7 / 7 / None / '' が混在しても安全にソート"""
     s = "" if x is None else str(x).strip()
-    # 文字列中の最初の数字を拾って数値化。なければ大きめにして末尾へ。
     n = 999999
     num = ""
     for ch in s:
@@ -139,13 +150,66 @@ def gw_and_lock_state(conf: Dict[str, str], matches: List[Dict]) -> Tuple[str, b
     return gw_name, locked, lock_at_utc
 
 # ------------------------------------------------------------
-# UI: トップ
+# トップ専用：BMカウントと次回担当
+# ------------------------------------------------------------
+def _get_bm_counts(users: List[str]) -> Dict[str, int]:
+    """bm_log シートの user カラムを単純集計。シートが無ければ 0。"""
+    counts = {u: 0 for u in users}
+    try:
+        rows = read_rows_by_sheet("bm_log") or []
+        for r in rows:
+            u = str(r.get("user", "")).strip()
+            if u in counts:
+                counts[u] += 1
+    except Exception:
+        pass
+    return counts
+
+def _pick_next_bm(users: List[str], counts: Dict[str, int]) -> str:
+    """最小回数 → ユーザーリストの順で安定選出（表示のみ。記録はしない）。"""
+    order = {u: i for i, u in enumerate(users)}
+    return sorted(users, key=lambda u: (counts.get(u, 0), order[u]))[0] if users else ""
+
+# ------------------------------------------------------------
+# UI: トップ（BM表示＋カウンタ）
 # ------------------------------------------------------------
 def page_home(conf: Dict[str, str], me: Dict):
     st.markdown("## トップ")
     st.info("ここでは簡単なガイドだけを表示。実際の操作は上部タブから。")
     if me:
         st.caption(f"ログイン中： {me['username']} ({me.get('role','')})")
+
+    # 表示用：users とカウンタ
+    users_conf = get_users(conf)
+    users = [u["username"] for u in users_conf]
+    counts = _get_bm_counts(users)
+    next_bm = _pick_next_bm(users, counts)
+    players = [u for u in users if u != next_bm]
+
+    # 3分割カード（BM=赤、その他=グレー）
+    st.markdown('<div class="section">次節のメンバー</div>', unsafe_allow_html=True)
+    st.markdown('<div class="role-cards">', unsafe_allow_html=True)
+    for u in users:
+        is_bm = (u == next_bm)
+        role_txt = "Bookmaker" if is_bm else "Player"
+        card_class = "role-card bm" if is_bm else "role-card"
+        html = f"""
+        <div class="{card_class}">
+          <div class="name">{u}</div>
+          <div class="role">{role_txt}</div>
+        </div>
+        """
+        st.markdown(html, unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # プレイヤー（安全策でテキスト表示も）
+    st.markdown('<div class="section">プレイヤー</div>', unsafe_allow_html=True)
+    st.write(", ".join(players) if players else "-")
+
+    # 担当回数
+    st.markdown('<div class="section">ブックメーカー担当回数（これまで）</div>', unsafe_allow_html=True)
+    badges = " ".join([f'<span class="badge">{u}: {counts.get(u,0)}</span>' for u in users])
+    st.markdown(f'<div class="badges">{badges}</div>', unsafe_allow_html=True)
 
 # ------------------------------------------------------------
 # UI: 試合とベット
@@ -238,8 +302,7 @@ def page_history(conf: Dict[str, str], me: Dict):
         st.info("履歴はまだありません。")
         return
 
-    # GW リストを安全に作成＆並び替え
-    gw_vals = { (b.get("gw") if b.get("gw") not in (None, "") else "") for b in bets }
+    gw_vals = {(b.get("gw") if b.get("gw") not in (None, "") else "") for b in bets}
     gw_set = sorted(gw_vals, key=_gw_sort_key)
     sel_gw = st.selectbox("表示するGW", gw_set, index=0 if gw_set else None, key="hist_gw")
 
