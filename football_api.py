@@ -1,74 +1,71 @@
-# /football_api.py
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
+import pytz
 import requests
 import streamlit as st
 
-JST = timezone(timedelta(hours=9))
-SESSION = requests.Session()
+FD_BASE = "https://api.football-data.org/v4"
 
-@st.cache_data(ttl=180, show_spinner=False)
-def _fd_headers() -> Dict[str, str]:
-    conf = st.session_state.get("_conf_cache") or {}
+def _tz(conf: Dict[str, str]):
+    name = conf.get("timezone") or "UTC"
+    try:
+        return pytz.timezone(name)
+    except Exception:
+        return pytz.UTC
+
+def _headers(conf: Dict[str, str]):
     token = conf.get("FOOTBALL_DATA_API_TOKEN", "")
-    return {"X-Auth-Token": token} if token else {}
+    return {"X-Auth-Token": token}
 
-@st.cache_data(ttl=180, show_spinner=False)
-def fetch_matches_window(days: int, competition: str = "2021", season: str = "2025") -> Tuple[Dict, Dict]:
-    """
-    football-data.org:
-    GET /v4/competitions/{competition}/matches?dateFrom=YYYY-MM-DD&dateTo=YYYY-MM-DD&season=2025
-    """
-    base = "https://api.football-data.org/v4/competitions"
-    frm = datetime.utcnow().date()
-    to = (datetime.utcnow().date() + timedelta(days=days))
-    url = f"{base}/{competition}/matches"
-    params = {"dateFrom": frm.isoformat(), "dateTo": to.isoformat(), "season": season}
-    headers = _fd_headers()
-    if not headers:
-        raise RuntimeError("FOOTBALL_DATA_API_TOKEN が未設定です（config を確認）。")
-    r = SESSION.get(url, headers=headers, params=params, timeout=(3, 10))
+def fetch_matches_window(days: int, conf: Dict[str, str]) -> List[Dict[str, Any]]:
+    """次のN日分の試合（競技会＝PL）を取得"""
+    comp = conf.get("FOOTBALL_DATA_COMPETITION", "PL")
+    season = conf.get("API_FOOTBALL_SEASON", "")
+    # 期間はUTCで投げる
+    now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+    date_from = now_utc.date().isoformat()
+    date_to = (now_utc + timedelta(days=days)).date().isoformat()
+    params = {"dateFrom": date_from, "dateTo": date_to}
+    if season:
+        params["season"] = season
+    url = f"{FD_BASE}/competitions/{comp}/matches"
+    r = requests.get(url, headers=_headers(conf), params=params, timeout=20)
     r.raise_for_status()
-    return r.json(), {"from": frm.isoformat(), "to": to.isoformat()}
+    data = r.json()
+    return data.get("matches", [])
 
-def simplify_matches(js: Dict) -> List[Dict]:
+def simplify_matches(raw: List[Dict[str, Any]], conf: Dict[str, str]) -> List[Dict[str, Any]]:
+    tz = _tz(conf)
     out = []
-    for m in js.get("matches", []):
-        score = m.get("score", {}) or {}
-        full = score.get("fullTime", {}) or {}
-        ht = m.get("homeTeam", {}) or {}
-        at = m.get("awayTeam", {}) or {}
+    for m in raw:
+        utc_iso = m.get("utcDate")
+        try:
+            utc_dt = datetime.fromisoformat(utc_iso.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        local_dt = utc_dt.astimezone(tz)
         out.append({
-            "id": m.get("id"),
-            "utcDate": m.get("utcDate"),
-            "status": m.get("status"),
-            "matchday": m.get("matchday"),
-            "homeTeam": ht.get("shortName") or ht.get("name"),
-            "awayTeam": at.get("shortName") or at.get("name"),
-            "score": f"{full.get('home', 0)}-{full.get('away', 0)}",
+            "id": str(m.get("id")),
+            "gw": f"GW{conf.get('current_gw', '').replace('GW','') or ''}",
+            "utc_kickoff": utc_dt,
+            "local_kickoff": local_dt,
+            "home": m.get("homeTeam", {}).get("name", ""),
+            "away": m.get("awayTeam", {}).get("name", ""),
+            "status": m.get("status", ""),
+            "score": m.get("score", {})  # raw score (for future RT)
         })
+    # kickoff 昇順
+    out.sort(key=lambda x: x["utc_kickoff"])
     return out
 
-def get_match_result_symbol(m: Dict, treat_inplay_as_provisional: bool = False) -> str | None:
-    """
-    戻り値: "HOME" | "DRAW" | "AWAY" | None
-    FINISHED は確定。treat_inplay_as_provisional=True なら IN_PLAY/PAUSED は途中スコアで暫定判定。
-    """
-    status = (m or {}).get("status")
-    sc = (m or {}).get("score", "0-0")
-    try:
-        h, a = [int(x) for x in sc.split("-")]
-    except Exception:
-        h, a = 0, 0
-
-    if status == "FINISHED":
-        if h > a: return "HOME"
-        if h < a: return "AWAY"
-        return "DRAW"
-
-    if treat_inplay_as_provisional and status in {"IN_PLAY", "PAUSED"}:
-        if h > a: return "HOME"
-        if h < a: return "AWAY"
-        return "DRAW"
-    return None
+def gw_lock_times(matches: List[Dict[str, Any]], conf: Dict[str, str]) -> Tuple[Optional[datetime], Optional[datetime]]:
+    """GWのロック開始/終了（UTC）を返す。最初の試合の2時間前〜最後の試合終了想定時刻(＋2h)"""
+    if not matches:
+        return None, None
+    earliest = min(m["utc_kickoff"] for m in matches)
+    latest = max(m["utc_kickoff"] for m in matches)
+    lock_start = earliest - timedelta(minutes=int(conf.get("lock_minutes_before_earliest", "120") or "120"))
+    # 終了は安全に+2時間
+    lock_end = latest + timedelta(hours=2)
+    return lock_start, lock_end
