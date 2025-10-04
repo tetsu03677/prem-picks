@@ -1,66 +1,47 @@
-from typing import List, Dict, Any, Tuple
+# football_api.py
 from datetime import datetime, timedelta, timezone
-import pytz
 import requests
 import streamlit as st
 
-FD_BASE = "https://api.football-data.org/v4"
+BASE = "https://api.football-data.org/v4"
 
-def _tz(conf):
-    return pytz.timezone(conf.get("timezone","Asia/Tokyo"))
+def _headers():
+    return {"X-Auth-Token": st.secrets["FOOTBALL_DATA_API_TOKEN"]}
 
-def _headers(conf):
-    return {"X-Auth-Token": conf["FOOTBALL_DATA_API_TOKEN"]}
+def _to_match_row(m, gw_tag="GW?"):
+    # v4の試合を内部形式へ
+    mid = str(m["id"])
+    status = m.get("status","SCHEDULED")
+    utc = datetime.fromisoformat(m["utcDate"].replace("Z","+00:00")).astimezone(timezone.utc)
+    home = m["homeTeam"]["name"]
+    away = m["awayTeam"]["name"]
+    return {"id": mid, "gw": gw_tag, "utc_kickoff": utc, "home": home, "away": away, "status": status}
 
-def _gw_from_date(dt_utc: datetime, conf) -> str:
-    return conf.get("current_gw","GW?")
-
-def fetch_matches_window(days: int, competition: str, conf) -> Tuple[List[Dict[str,Any]], str]:
-    tz = _tz(conf)
-    now_local = datetime.now(tz)
-    date_from = now_local.date().isoformat()
-    date_to = (now_local + timedelta(days=days)).date().isoformat()
-    url = f"{FD_BASE}/competitions/{competition}/matches"
-    params = {
-        "dateFrom": date_from,
-        "dateTo": date_to,
-        "season": conf.get("API_FOOTBALL_SEASON","2025")
-    }
-    r = requests.get(url, headers=_headers(conf), params=params, timeout=30)
+def fetch_matches_window(day_window: int, competition: str, season: str, status=None):
+    date_from = datetime.utcnow().date()
+    date_to = date_from + timedelta(days=day_window)
+    params = {"dateFrom": str(date_from), "dateTo": str(date_to), "competitions": competition}
+    if status:
+        params["status"] = status
+    url = f"{BASE}/matches"
+    r = requests.get(url, headers=_headers(), params=params, timeout=30)
     r.raise_for_status()
-    js = r.json()
-    matches_raw = js.get("matches", [])
+    data = r.json().get("matches", [])
+    # GW判定：最も近い週を仮にGWタグに
+    gw = "GW?"
+    rows = [_to_match_row(m, gw) for m in data]
+    return rows, gw
 
-    out = []
-    for m in matches_raw:
-        mid = str(m.get("id"))
-        utc_str = m.get("utcDate")
-        try:
-            utc_dt = datetime.fromisoformat(utc_str.replace("Z","+00:00"))
-        except Exception:
-            continue
-        local_dt = utc_dt.astimezone(tz)
-        status = m.get("status","SCHEDULED")
-        home = m.get("homeTeam",{}).get("name","")
-        away = m.get("awayTeam",{}).get("name","")
-        score = m.get("score",{})
-        full = score.get("fullTime",{})
-        h_ft = full.get("home")
-        a_ft = full.get("away")
-        out.append({
-            "id": mid,
-            "gw": _gw_from_date(utc_dt, conf),
-            "utc_kickoff": utc_dt.replace(tzinfo=timezone.utc),
-            "local_kickoff": local_dt,
-            "home": home,
-            "away": away,
-            "status": status,
-            "score_home": h_ft,
-            "score_away": a_ft,
-        })
-    gw_display = conf.get("current_gw") or (out[0]["gw"] if out else "GW?")
-    return out, gw_display
-
-def fetch_live_snapshot(competition: str, conf) -> List[Dict[str,Any]]:
-    matches, _ = fetch_matches_window(7, competition, conf)
-    return matches
+def fetch_matches_next_gw(conf, day_window=7, accept_today=False, include_live=False):
+    comp = conf.get("FOOTBALL_DATA_COMPETITION","PL")
+    season = conf.get("API_FOOTBALL_SEASON","2025")
+    rows, gw = fetch_matches_window(day_window, comp, season)
+    if not rows:
+        return [], gw
+    # 今日より前は除外（accept_todayで当日含む）
+    today = datetime.utcnow().date()
+    rows = [r for r in rows if r["utc_kickoff"].date() > today or (accept_today and r["utc_kickoff"].date()==today)]
+    if not include_live:
+        return rows, gw
+    # ライブ・終了試合も混ざる場合は status フィルタ不要（v4は自動で返す）
+    return rows, gw
