@@ -17,7 +17,7 @@ from football_api import (
 )
 
 # ------------------------------------------------------------
-# スタイル（アイコンは使わない・落ち着いた最小限）
+# スタイル（最小・落ち着いた見た目）
 # ------------------------------------------------------------
 CSS = """
 <style>
@@ -30,7 +30,6 @@ CSS = """
 .kpi .v{font-size:1.3rem; font-weight:700; margin-top:2px}
 .section{margin:16px 0 10px}
 table {width:100%}
-.login-hidden {display:none}
 </style>
 """
 st.set_page_config(page_title="Premier Picks", layout="wide")
@@ -55,9 +54,7 @@ def parse_float(x, default=None):
         return default
 
 def _gw_sort_key(x):
-    """GWの並び替え用：GW7 / 7 / None / '' が混在しても安全にソート"""
     s = "" if x is None else str(x).strip()
-    # 文字列中の最初の数字を拾って数値化。なければ大きめにして末尾へ。
     n = 999999
     num = ""
     for ch in s:
@@ -89,42 +86,32 @@ def get_users(conf: Dict[str, str]) -> List[Dict]:
         return [{"username": "guest", "password": "guest", "role": "user", "team": ""}]
 
 # ------------------------------------------------------------
-# 認証
+# 認証（ログイン済みなら描画しない）
 # ------------------------------------------------------------
 def login_ui(conf: Dict[str, str]) -> Dict:
-    signed = st.session_state.get("signed_in") is True
-    me = st.session_state.get("me")
+    # ★唯一の変更点：ログイン済みならUIを何も描画せず即 return
+    if st.session_state.get("signed_in") and st.session_state.get("me"):
+        return st.session_state["me"]
 
-    card_class = "login-hidden" if signed and me else "app-card"
-    with st.container():
-        st.markdown(f'<div class="{card_class}">', unsafe_allow_html=True)
+    st.markdown('<div class="app-card">', unsafe_allow_html=True)
+    st.markdown("## Premier Picks")
 
-        st.markdown("## Premier Picks")
-        users = get_users(conf)
-        usernames = [u["username"] for u in users]
-        default_idx = max(0, usernames.index(me["username"])) if (signed and me and me["username"] in usernames) else 0
+    users = get_users(conf)
+    usernames = [u["username"] for u in users]
+    user_sel = st.selectbox("ユーザー", usernames, index=0, key="login_user_sel")
+    pwd = st.text_input("パスワード", type="password", key="login_pwd")
 
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            user_sel = st.selectbox("ユーザー", usernames, index=default_idx, key="login_user_sel")
-        with c2:
-            pwd = st.text_input("パスワード", type="password", key="login_pwd")
+    if st.button("ログイン", use_container_width=True, key="btn_login"):
+        selected = next((u for u in users if u["username"] == user_sel), None)
+        if selected and pwd == selected.get("password", ""):
+            st.session_state["signed_in"] = True
+            st.session_state["me"] = selected
+            st.success(f"ようこそ {selected['username']} さん！")
+            st.rerun()
+        else:
+            st.warning("ユーザー名またはパスワードが違います。")
 
-        if st.button("ログイン", use_container_width=True, key="btn_login"):
-            selected = next((u for u in users if u["username"] == user_sel), None)
-            if selected and pwd == selected.get("password", ""):
-                st.session_state["signed_in"] = True
-                st.session_state["me"] = selected
-                st.success(f"ようこそ {selected['username']} さん！")
-                st.rerun()
-            else:
-                st.warning("ユーザー名またはパスワードが違います。")
-
-        if signed and me:
-            st.success(f"ようこそ {me['username']} さん！")
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
+    st.markdown("</div>", unsafe_allow_html=True)
     return st.session_state.get("me")
 
 # ------------------------------------------------------------
@@ -217,7 +204,7 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
                         "gw": gw_name,
                         "user": me["username"],
                         "match_id": match_id,
-                        "match": m["home"],  # 列構成準拠
+                        "match": m["home"],
                         "pick": pick,
                         "stake": str(int(stake)),
                         "odds": str(use_odds),
@@ -240,8 +227,7 @@ def page_history(conf: Dict[str, str], me: Dict):
         st.info("履歴はまだありません。")
         return
 
-    # GW リストを安全に作成＆並び替え
-    gw_vals = { (b.get("gw") if b.get("gw") not in (None, "") else "") for b in bets }
+    gw_vals = {(b.get("gw") if b.get("gw") not in (None, "") else "") for b in bets}
     gw_set = sorted(gw_vals, key=_gw_sort_key)
     sel_gw = st.selectbox("表示するGW", gw_set, index=0 if gw_set else None, key="hist_gw")
 
