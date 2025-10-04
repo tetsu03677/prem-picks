@@ -43,6 +43,10 @@ table {width:100%}
 .badges{display:flex; gap:8px; flex-wrap:wrap; margin-top:6px}
 .badge{display:inline-block; padding:3px 8px; border-radius:999px; font-size:.85rem;
        border:1px solid rgba(120,120,120,.25); background:rgba(255,255,255,.06)}
+
+/* ログイン見出し（枠なし・少し大きめ。安全策） */
+.login-title{font-size:1.5rem; font-weight:700; margin:0 0 8px 2px;}
+.login-area{padding:2px 0 0;} /* 余白のみ。枠は出さない */
 </style>
 """
 st.set_page_config(page_title="Premier Picks", layout="wide")
@@ -100,22 +104,19 @@ def get_users(conf: Dict[str, str]) -> List[Dict]:
         return [{"username": "guest", "password": "guest", "role": "user", "team": ""}]
 
 # ------------------------------------------------------------
-# 認証（ログイン後はUIを描画しない）
+# 認証（ログイン後はUIを描画しない） ★ここだけ変更：枠ナシ見出し
 # ------------------------------------------------------------
 def login_ui(conf: Dict[str, str]) -> Dict:
     # すでにログイン済ならフォームは描画しないでそのまま返す
     if st.session_state.get("signed_in") and st.session_state.get("me"):
         return st.session_state.get("me")
 
-    # 未ログイン時のみカードを表示
+    # 未ログイン時のみフォームを表示（枠なし、安全）
     with st.container():
-        st.markdown('<div class="app-card">', unsafe_allow_html=True)
+        st.markdown('<div class="login-area">', unsafe_allow_html=True)
 
-        # タイトルは安全策（シンプルdiv、余計な枠や装飾なし）
-        st.markdown(
-            '<div style="font-weight:700; font-size:1.1rem; margin:0 0 12px 0;">Premier Picks</div>',
-            unsafe_allow_html=True
-        )
+        # 見出しをやや大きく。boxやborderは使わない
+        st.markdown('<div class="login-title">Premier Picks</div>', unsafe_allow_html=True)
 
         users = get_users(conf)
         usernames = [u["username"] for u in users]
