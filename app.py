@@ -17,11 +17,18 @@ from football_api import (
 )
 
 # ------------------------------------------------------------
-# スタイル（アイコンは使わない・落ち着いた最小限）
+# スタイル（アイコンは使わない・落ち着いた最小限） ← 余白だけ調整
 # ------------------------------------------------------------
 CSS = """
 <style>
-.block-container {padding-top:1.5rem; padding-bottom:3rem;}
+/* 全体余白：PCは控えめ、モバイルは多めにして上の切れを防ぐ */
+.block-container {padding-top:3.5rem; padding-bottom:3rem;}
+@media (max-width: 640px){
+  .block-container {padding-top:5rem; padding-bottom:3.5rem;}
+  .stTabs [role="tablist"]{margin-top:.25rem}
+}
+
+/* 既存のUI */
 .app-card{border:1px solid rgba(120,120,120,.25); border-radius:10px; padding:18px; background:rgba(255,255,255,.02);}
 .subtle{color:rgba(255,255,255,.6); font-size:.9rem}
 .kpi-row{display:flex; gap:12px; flex-wrap:wrap}
@@ -55,7 +62,6 @@ def parse_float(x, default=None):
         return default
 
 def _gw_sort_key(x):
-    """GWの並び替え用：GW7 / 7 / None / '' が混在しても安全にソート"""
     s = "" if x is None else str(x).strip()
     n = 999999
     num = ""
@@ -93,23 +99,18 @@ def get_users(conf: Dict[str, str]) -> List[Dict]:
 def login_ui(conf: Dict[str, str]) -> Dict:
     signed = st.session_state.get("signed_in") is True
     me = st.session_state.get("me")
-
-    # すでにログイン済みなら UI を描画せず即返す
     if signed and me:
-        return me
+        return me  # 既にログインしていればフォームを描画しない
 
-    # 未ログイン時のみフォームを表示
     with st.container():
         st.markdown('<div class="app-card">', unsafe_allow_html=True)
-
         st.markdown("## Premier Picks")
         users = get_users(conf)
         usernames = [u["username"] for u in users]
-        default_idx = 0
 
         c1, c2 = st.columns([1, 1])
         with c1:
-            user_sel = st.selectbox("ユーザー", usernames, index=default_idx, key="login_user_sel")
+            user_sel = st.selectbox("ユーザー", usernames, index=0, key="login_user_sel")
         with c2:
             pwd = st.text_input("パスワード", type="password", key="login_pwd")
 
@@ -122,7 +123,6 @@ def login_ui(conf: Dict[str, str]) -> Dict:
                 st.rerun()
             else:
                 st.warning("ユーザー名またはパスワードが違います。")
-
         st.markdown("</div>", unsafe_allow_html=True)
 
     return st.session_state.get("me")
@@ -162,7 +162,11 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
     my_gw_bets = [b for b in bets_all if (b.get("user") == me["username"] and (b.get("gw") == gw_name or b.get("gw") == gw_name.replace("GW","")))]
     my_total = sum(parse_int(b.get("stake", 0)) for b in my_gw_bets)
     max_total = parse_int(conf.get("max_total_stake_per_gw", 5000), 5000)
-    st.markdown(f'<div class="kpi-row"><div class="kpi"><div class="h">このGWのあなたの投票合計</div><div class="v">{my_total:,} / 上限 {max_total:,}</div></div></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="kpi-row"><div class="kpi"><div class="h">このGWのあなたの投票合計</div>'
+        f'<div class="v">{my_total:,} / 上限 {max_total:,}</div></div></div>',
+        unsafe_allow_html=True
+    )
 
     if locked:
         st.error("ロック済み（このGWの最初の試合 2 時間前で締切）")
