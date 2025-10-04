@@ -21,8 +21,9 @@ from football_api import (
 # ------------------------------------------------------------
 CSS = """
 <style>
-/* ① 上が切れる対策: 余白を少し広げる（他は触らない） */
-.block-container {padding-top:3.2rem; padding-bottom:3rem;}
+/* 上が見切れないように安全側で広めに確保 */
+.block-container {padding-top:2.25rem; padding-bottom:3rem;}
+/* 汎用カード */
 .app-card{border:1px solid rgba(120,120,120,.25); border-radius:10px; padding:18px; background:rgba(255,255,255,.02);}
 .subtle{color:rgba(255,255,255,.6); font-size:.9rem}
 .kpi-row{display:flex; gap:12px; flex-wrap:wrap}
@@ -32,10 +33,16 @@ CSS = """
 .section{margin:16px 0 10px}
 table {width:100%}
 .login-hidden {display:none}
-.badge-row{display:flex; gap:8px; flex-wrap:wrap; margin-top:6px}
-.badge{border:1px solid rgba(120,120,120,.25); border-radius:999px; padding:4px 10px; font-size:.9rem}
-.card-title{font-size:.95rem; color:rgba(255,255,255,.65); margin-bottom:6px}
-.hr{height:1px; background:rgba(255,255,255,.08); margin:10px 0}
+/* トップの3分割ブロック（安全策・最小装飾） */
+.role-cards{display:flex; gap:12px; flex-wrap:wrap}
+.role-card{flex:1 1 180px; border-radius:12px; padding:12px 14px; border:1px solid rgba(120,120,120,.25); background:rgba(255,255,255,.02)}
+.role-card.gray{background:rgba(255,255,255,.03)}
+.role-card.red{background:rgba(255,80,80,.08); border-color:rgba(255,80,80,.35)}
+.role-card .name{font-weight:700; font-size:1.05rem}
+.role-card .role{font-size:.85rem; opacity:.7}
+.badge{display:inline-block; padding:2px 8px; border-radius:999px; font-size:.75rem; border:1px solid rgba(120,120,120,.25); margin-top:6px}
+.badge.gray{background:rgba(255,255,255,.06)}
+.badge.red{background:rgba(255,80,80,.12); border-color:rgba(255,80,80,.35)}
 </style>
 """
 st.set_page_config(page_title="Premier Picks", layout="wide")
@@ -76,19 +83,6 @@ def _gw_sort_key(x):
             n = 999999
     return (n, s)
 
-def _gw_number(gw_str: str) -> int:
-    """'GW7' -> 7 / '7'->7 / その他->1"""
-    if not gw_str:
-        return 1
-    s = str(gw_str)
-    num = ""
-    for ch in s:
-        if ch.isdigit():
-            num += ch
-        elif num:
-            break
-    return int(num) if num else 1
-
 # ------------------------------------------------------------
 # 設定読込
 # ------------------------------------------------------------
@@ -106,21 +100,20 @@ def get_users(conf: Dict[str, str]) -> List[Dict]:
         return [{"username": "guest", "password": "guest", "role": "user", "team": ""}]
 
 # ------------------------------------------------------------
-# 認証（ログイン後はUI非表示）
+# 認証
 # ------------------------------------------------------------
 def login_ui(conf: Dict[str, str]) -> Dict:
     signed = st.session_state.get("signed_in") is True
     me = st.session_state.get("me")
-    if signed and me:
-        return me
 
+    card_class = "login-hidden" if signed and me else "app-card"
     with st.container():
-        st.markdown('<div class="app-card">', unsafe_allow_html=True)
-        st.markdown("## Premier Picks")
+        st.markdown(f'<div class="{card_class}">', unsafe_allow_html=True)
 
+        st.markdown("## Premier Picks")
         users = get_users(conf)
         usernames = [u["username"] for u in users]
-        default_idx = 0
+        default_idx = max(0, usernames.index(me["username"])) if (signed and me and me["username"] in usernames) else 0
 
         c1, c2 = st.columns([1, 1])
         with c1:
@@ -137,6 +130,9 @@ def login_ui(conf: Dict[str, str]) -> Dict:
                 st.rerun()
             else:
                 st.warning("ユーザー名またはパスワードが違います。")
+
+        if signed and me:
+            st.success(f"ようこそ {me['username']} さん！")
 
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -155,45 +151,59 @@ def gw_and_lock_state(conf: Dict[str, str], matches: List[Dict]) -> Tuple[str, b
     gw_name = matches[0].get("gw") or conf.get("current_gw", "")
     return gw_name, locked, lock_at_utc
 
-# ------------------------------------------------------------
-# ブックメーカーローテーション
-# ------------------------------------------------------------
-def compute_bookmaker_rotation(conf: Dict[str, str]) -> Tuple[str, Dict[str, int], List[str], bool]:
-    """
-    返り値:
-      current_bm: 今節のBM（開始前は "-"）
-      counts    : これまでの担当回数（今節開始前は全員0 / 開始後は今節BMだけ1）
-      players   : ② BM以外（2人）。未開始時は全員。
-      started   : 今節の初回キックオフ済みか
-    """
+# ============================================================
+# ここから：ブックメーカー自動ローテーション（トップ専用）
+# ============================================================
+def _get_bm_counts() -> Dict[str, int]:
+    """bm_log からユーザー別担当回数を集計"""
+    rows = read_rows_by_sheet("bm_log") or []
+    counts: Dict[str, int] = {}
+    for r in rows:
+        u = (r.get("bookmaker") or "").strip()
+        if not u:
+            continue
+        counts[u] = counts.get(u, 0) + 1
+    return counts
+
+def _decide_bm_user(users: List[str], counts: Dict[str, int]) -> str:
+    """回数の少ない順（同数なら users の並び優先）で次のBMを選ぶ"""
+    # counts にないユーザーは 0 とみなす
+    order = sorted(users, key=lambda u: (counts.get(u, 0), users.index(u)))
+    return order[0] if order else ""
+
+def _ensure_bm_for_gw(conf: Dict[str, str], matches_raw: List[Dict], gw: str) -> str:
+    """GW初回KO後に未記録なら bm_log に確定保存。戻り値は当該GWのBM（未確定時は '' ）"""
+    if not matches_raw:
+        return ""
+    # 既に記録済みならそれを返す
+    existing = [r for r in (read_rows_by_sheet("bm_log") or []) if str(r.get("gw")) == str(gw)]
+    if existing:
+        return existing[0].get("bookmaker", "") or ""
+
+    # キックオフ前なら確定しない（表示は '-'）
+    earliest = min(m["utc_kickoff"] for m in matches_raw if m.get("utc_kickoff"))
+    if now_utc() < earliest:
+        return ""
+
+    # 初回KO後：自動ローテーションで決定して記録
     users = [u["username"] for u in get_users(conf)]
-    n = len(users) if users else 0
-    if n == 0:
-        return "-", {}, [], False
+    counts = _get_bm_counts()
+    bm_user = _decide_bm_user(users, counts)
+    if not bm_user:
+        return ""
 
-    matches_raw, gw_str = fetch_matches_next_gw(conf, day_window=7)
-    gw_num = _gw_number(gw_str or conf.get("current_gw", "GW1"))
-
-    started = False
-    if matches_raw:
-        earliest_utc = min(m["utc_kickoff"] for m in matches_raw if m.get("utc_kickoff"))
-        started = now_utc() >= earliest_utc
-
-    # 今節BM: ラウンドロビン（順番は users_json の並び）
-    current_bm = users[(gw_num - 1) % n] if started else "-"
-
-    # ③ カウンター: 今節開始前は 0 / 開始後は 今節BM=1, 他=0
-    counts = {u: 0 for u in users}
-    if started and current_bm != "-":
-        counts[current_bm] = 1
-
-    # ② プレイヤー = BM以外（2人）。未開始時は全員を表示
-    players = [u for u in users if u != current_bm] if current_bm != "-" else users
-
-    return current_bm, counts, players, started
+    row = {
+        "gw": str(gw),
+        "gw_number": "".join([c for c in str(gw) if c.isdigit()]) or "",
+        "bookmaker": bm_user,
+        "decided_at": datetime.utcnow().isoformat() + "Z",
+    }
+    # 1GW1行のため、key=gw で upsert
+    upsert_row("bm_log", row, key_col="gw")
+    return bm_user
 
 # ------------------------------------------------------------
-# UI: トップ（BM & プレイヤー表示、収支ランキング）
+# UI: トップ（★今回のみ変更）
 # ------------------------------------------------------------
 def page_home(conf: Dict[str, str], me: Dict):
     st.markdown("## トップ")
@@ -201,53 +211,69 @@ def page_home(conf: Dict[str, str], me: Dict):
     if me:
         st.caption(f"ログイン中： {me['username']} ({me.get('role','')})")
 
-    # 次節メンバー
-    with st.container():
-        st.markdown('<div class="app-card">', unsafe_allow_html=True)
-        st.markdown('<div class="card-title">次節のメンバー</div>', unsafe_allow_html=True)
+    # 次節の試合 + GW
+    matches_raw, gw = fetch_matches_next_gw(conf, day_window=7)
 
-        current_bm, bm_counts, players, started = compute_bookmaker_rotation(conf)
+    # 次節BM確定（キックオフ前は確定しない）
+    bm_user = _ensure_bm_for_gw(conf, matches_raw, gw) if gw else ""
 
-        # ブックメーカー
-        st.markdown("**ブックメーカー**")
-        st.markdown(f'<div class="badge-row"><span class="badge">{current_bm}</span></div>', unsafe_allow_html=True)
+    # 表示用：users とカウンタ
+    users_conf = get_users(conf)
+    users = [u["username"] for u in users_conf]
+    counts = _get_bm_counts()
 
-        # ② プレイヤー（BM以外の2人。未開始時は全員）
-        st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
-        st.markdown("**プレイヤー**")
-        chips = "".join([f'<span class="badge">{u}</span>' for u in players])
-        st.markdown(f'<div class="badge-row">{chips}</div>', unsafe_allow_html=True)
+    # 3分割ブロック（BM=赤、その他=グレー）
+    st.markdown('<div class="section">次節のメンバー</div>', unsafe_allow_html=True)
+    st.markdown('<div class="role-cards">', unsafe_allow_html=True)
 
-        # ② カウンター（安全策表示）
-        st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
-        st.markdown("**ブックメーカー担当回数（これまで）**")
-        chips2 = "".join([f'<span class="badge">{u}: {bm_counts.get(u,0)}</span>' for u in sorted(bm_counts.keys())])
-        st.markdown(f'<div class="badge-row">{chips2}</div>', unsafe_allow_html=True)
+    # BMが未確定の場合は "-" として全員グレー表示
+    for u in users:
+        is_bm = (u == bm_user) and bool(bm_user)
+        role_text = "Bookmaker" if is_bm else "Player"
+        box_class = "role-card red" if is_bm else "role-card gray"
+        badge_class = "badge red" if is_bm else "badge gray"
+        cnt = counts.get(u, 0)
+        html = (
+            f'<div class="{box_class}">'
+            f'  <div class="name">{u}</div>'
+            f'  <div class="role">{role_text}</div>'
+            f'  <div class="{badge_class}" style="margin-top:8px;">BM回数：{cnt}</div>'
+            f'</div>'
+        )
+        st.markdown(html, unsafe_allow_html=True)
 
-        st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    # 収支ランキング（確定のみ）
-    st.markdown('<div class="section">ユーザー別 収支ランキング（確定ベットのみ集計）</div>', unsafe_allow_html=True)
-    bets = read_rows_by_sheet("bets")
-    finish = [b for b in bets if (b.get("result") or "").upper() in ("WIN","LOSE")]
-    if not finish:
-        st.caption("まだ確定済みのベットがありません。")
+    # プレイヤー（= BM以外の2名）を明示（安全策でテキストのみ）
+    st.markdown('<div class="section">プレイヤー</div>', unsafe_allow_html=True)
+    if bm_user:
+        players = [u for u in users if u != bm_user]
+        st.write(", ".join(players))
     else:
-        net_by_user = {}
-        for b in finish:
-            u = b.get("user","")
-            stake = parse_int(b.get("stake",0))
-            payout = parse_float(b.get("payout"),0.0) or 0.0
-            if (b.get("result") or "").upper() == "WIN":
-                net_by_user[u] = net_by_user.get(u,0.0) + (payout - stake)
-            else:
-                net_by_user[u] = net_by_user.get(u,0.0) - stake
-        ranking = sorted(net_by_user.items(), key=lambda x: (-x[1], x[0]))
-        for i,(u,v) in enumerate(ranking, start=1):
-            st.markdown(f"{i}. **{u}**　…　{v:,.2f}")
+        st.write("-")
+
+    # 収支ランキング（確定済みベットのみ）
+    st.markdown('<div class="section">ユーザー別 収支ランキング（確定ベットのみ集計）</div>', unsafe_allow_html=True)
+    bets = read_rows_by_sheet("bets") or []
+    nets: Dict[str, float] = {}
+    for b in bets:
+        res = (b.get("result") or "").upper()
+        if res not in ("WIN", "LOSE"):
+            continue
+        user = b.get("user", "")
+        stake = parse_int(b.get("stake", 0))
+        payout = parse_float(b.get("payout"), 0.0) or 0.0
+        net = payout - stake
+        nets[user] = nets.get(user, 0.0) + net
+    if nets:
+        ranking = sorted(nets.items(), key=lambda kv: (-kv[1], kv[0]))
+        for i, (u, v) in enumerate(ranking, 1):
+            st.markdown(f"{i}. **{u}**　{v:,.2f}")
+    else:
+        st.caption("まだ確定済みのベットがありません。")
 
 # ------------------------------------------------------------
-# UI: 試合とベット
+# UI: 試合とベット（変更なし）
 # ------------------------------------------------------------
 def page_matches_and_bets(conf: Dict[str, str], me: Dict):
     st.markdown("## 試合とベット")
@@ -327,7 +353,7 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
                     st.rerun()
 
 # ------------------------------------------------------------
-# UI: 履歴（収支明示）
+# UI: 履歴（収支明示：変更なし）
 # ------------------------------------------------------------
 def page_history(conf: Dict[str, str], me: Dict):
     st.markdown("## 履歴")
@@ -374,7 +400,7 @@ def page_history(conf: Dict[str, str], me: Dict):
         row_view(b)
 
 # ------------------------------------------------------------
-# UI: リアルタイム
+# UI: リアルタイム（変更なし）
 # ------------------------------------------------------------
 def page_realtime(conf: Dict[str, str], me: Dict):
     st.markdown("## リアルタイム")
@@ -463,7 +489,7 @@ def page_realtime(conf: Dict[str, str], me: Dict):
         st.rerun()
 
 # ------------------------------------------------------------
-# UI: ダッシュボード
+# UI: ダッシュボード（変更なし）
 # ------------------------------------------------------------
 def page_dashboard(conf: Dict[str, str], me: Dict):
     st.markdown("## ダッシュボード")
@@ -527,7 +553,7 @@ def page_dashboard(conf: Dict[str, str], me: Dict):
             st.caption(f"　- {t}: 的中率 {acc*100:.1f}%（{n}件）／ 累計net {net:,.2f}")
 
 # ------------------------------------------------------------
-# UI: オッズ管理（ロック廃止）
+# UI: オッズ管理（ロック廃止・変更なし）
 # ------------------------------------------------------------
 def page_odds_admin(conf: Dict[str, str], me: Dict):
     st.markdown("## オッズ管理")
