@@ -21,7 +21,9 @@ from football_api import (
 # ------------------------------------------------------------
 CSS = """
 <style>
-.block-container {padding-top:1.5rem; padding-bottom:3rem;}
+/* ← タブ上部が切れないように上マージンを増量 */
+.block-container {padding-top:3.2rem; padding-bottom:3rem;}
+
 .app-card{border:1px solid rgba(120,120,120,.25); border-radius:10px; padding:18px; background:rgba(255,255,255,.02);}
 .subtle{color:rgba(255,255,255,.6); font-size:.9rem}
 .kpi-row{display:flex; gap:12px; flex-wrap:wrap}
@@ -31,6 +33,16 @@ CSS = """
 .section{margin:16px 0 10px}
 table {width:100%}
 .login-hidden {display:none}
+
+/* トップの3分割カード（BM=赤、その他=グレー） */
+.role-cards{display:flex; gap:12px; flex-wrap:wrap}
+.role-card{flex:1 1 0; min-width:120px; border:1px solid rgba(120,120,120,.25); border-radius:12px; padding:12px 14px; background:rgba(255,255,255,.02)}
+.role-card.bm{border-color:rgba(255,0,0,.35); background:rgba(255,0,0,.08)}
+.role-card .name{font-weight:700; font-size:1.05rem}
+.role-card .role{font-size:.9rem; color:rgba(255,255,255,.7)}
+.badges{display:flex; gap:8px; flex-wrap:wrap; margin-top:6px}
+.badge{display:inline-block; padding:3px 8px; border-radius:999px; font-size:.85rem;
+       border:1px solid rgba(120,120,120,.25); background:rgba(255,255,255,.06)}
 </style>
 """
 st.set_page_config(page_title="Premier Picks", layout="wide")
@@ -88,17 +100,22 @@ def get_users(conf: Dict[str, str]) -> List[Dict]:
         return [{"username": "guest", "password": "guest", "role": "user", "team": ""}]
 
 # ------------------------------------------------------------
-# 認証（ログイン後はUIを描画しない）★タイトルは安全策でシンプル表示
+# 認証（ログイン後はUIを描画しない）
 # ------------------------------------------------------------
 def login_ui(conf: Dict[str, str]) -> Dict:
     # すでにログイン済ならフォームは描画しないでそのまま返す
     if st.session_state.get("signed_in") and st.session_state.get("me"):
         return st.session_state.get("me")
 
-    # 未ログイン時のみカードを表示（タイトルは安全策＝シンプル）
-    st.markdown("### ログイン")  # ← 余計な装飾を避けた安全表示
+    # 未ログイン時のみカードを表示
     with st.container():
         st.markdown('<div class="app-card">', unsafe_allow_html=True)
+
+        # タイトルは安全策（シンプルdiv、余計な枠や装飾なし）
+        st.markdown(
+            '<div style="font-weight:700; font-size:1.1rem; margin:0 0 12px 0;">Premier Picks</div>',
+            unsafe_allow_html=True
+        )
 
         users = get_users(conf)
         usernames = [u["username"] for u in users]
@@ -138,13 +155,66 @@ def gw_and_lock_state(conf: Dict[str, str], matches: List[Dict]) -> Tuple[str, b
     return gw_name, locked, lock_at_utc
 
 # ------------------------------------------------------------
-# UI: トップ
+# トップ専用：BMカウントと次回担当
+# ------------------------------------------------------------
+def _get_bm_counts(users: List[str]) -> Dict[str, int]:
+    """bm_log シートの user カラムを単純集計。シートが無ければ 0。"""
+    counts = {u: 0 for u in users}
+    try:
+        rows = read_rows_by_sheet("bm_log") or []
+        for r in rows:
+            u = str(r.get("user", "")).strip()
+            if u in counts:
+                counts[u] += 1
+    except Exception:
+        pass
+    return counts
+
+def _pick_next_bm(users: List[str], counts: Dict[str, int]) -> str:
+    """最小回数 → ユーザーリストの順で安定選出（表示のみ。記録はしない）。"""
+    order = {u: i for i, u in enumerate(users)}
+    return sorted(users, key=lambda u: (counts.get(u, 0), order[u]))[0] if users else ""
+
+# ------------------------------------------------------------
+# UI: トップ（BM表示＋カウンタ）
 # ------------------------------------------------------------
 def page_home(conf: Dict[str, str], me: Dict):
     st.markdown("## トップ")
     st.info("ここでは簡単なガイドだけを表示。実際の操作は上部タブから。")
     if me:
         st.caption(f"ログイン中： {me['username']} ({me.get('role','')})")
+
+    # 表示用：users とカウンタ
+    users_conf = get_users(conf)
+    users = [u["username"] for u in users_conf]
+    counts = _get_bm_counts(users)
+    next_bm = _pick_next_bm(users, counts)
+    players = [u for u in users if u != next_bm]
+
+    # 3分割カード（BM=赤、その他=グレー）
+    st.markdown('<div class="section">次節のメンバー</div>', unsafe_allow_html=True)
+    st.markdown('<div class="role-cards">', unsafe_allow_html=True)
+    for u in users:
+        is_bm = (u == next_bm)
+        role_txt = "Bookmaker" if is_bm else "Player"
+        card_class = "role-card bm" if is_bm else "role-card"
+        html = (
+            f'<div class="{card_class}">'
+            f'<div class="name">{u}</div>'
+            f'<div class="role">{role_txt}</div>'
+            f'</div>'
+        )
+        st.markdown(html, unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # プレイヤー（安全策でテキスト表示も）
+    st.markdown('<div class="section">プレイヤー</div>', unsafe_allow_html=True)
+    st.write(", ".join(players) if players else "-")
+
+    # 担当回数
+    st.markdown('<div class="section">ブックメーカー担当回数（これまで）</div>', unsafe_allow_html=True)
+    badges = " ".join([f'<span class="badge">{u}: {counts.get(u,0)}</span>' for u in users])
+    st.markdown(f'<div class="badges">{badges}</div>', unsafe_allow_html=True)
 
 # ------------------------------------------------------------
 # UI: 試合とベット
@@ -237,8 +307,7 @@ def page_history(conf: Dict[str, str], me: Dict):
         st.info("履歴はまだありません。")
         return
 
-    # GW リストを安全に作成＆並び替え
-    gw_vals = { (b.get("gw") if b.get("gw") not in (None, "") else "") for b in bets }
+    gw_vals = {(b.get("gw") if b.get("gw") not in (None, "") else "") for b in bets}
     gw_set = sorted(gw_vals, key=_gw_sort_key)
     sel_gw = st.selectbox("表示するGW", gw_set, index=0 if gw_set else None, key="hist_gw")
 
@@ -428,7 +497,7 @@ def page_dashboard(conf: Dict[str, str], me: Dict):
             st.caption(f"　- {t}: 的中率 {acc*100:.1f}%（{n}件）／ 累計net {net:,.2f}")
 
 # ------------------------------------------------------------
-# UI: オッズ管理（★一括保存ボタンを最上部に配置／刻み0.1・横並び）
+# UI: オッズ管理（入力は横並び・フォーム化・刻み0.1）
 # ------------------------------------------------------------
 def page_odds_admin(conf: Dict[str, str], me: Dict):
     st.markdown("## オッズ管理")
@@ -444,57 +513,45 @@ def page_odds_admin(conf: Dict[str, str], me: Dict):
     odds_rows = read_rows_by_sheet("odds")
     odds_by_match = {str(r.get("match_id")): r for r in odds_rows if r.get("match_id")}
 
-    # ---- ここからフォーム：一括保存ボタンを最上部に配置 ----
-    with st.form("odds_bulk_form", clear_on_submit=False):
-        # 一括保存ボタン（最上部）
-        submitted = st.form_submit_button("一括保存", disabled=not is_admin, use_container_width=True)
+    for m in matches_raw:
+        mid = str(m["id"])
+        od = odds_by_match.get(mid, {})
+        with st.container(border=True):
+            st.markdown(f"**{m['home']} vs {m['away']}**　（{gw}）")
 
-        # 入力群（横並び / 刻み0.1）
-        mids: List[str] = []
-        for m in matches_raw:
-            mid = str(m["id"])
-            mids.append(mid)
-            od = odds_by_match.get(mid, {})
-            with st.container(border=True):
-                st.markdown(f"**{m['home']} vs {m['away']}**　（{gw}）")
-                c1, c2, c3 = st.columns(3)
+            # フォームで包み、保存時のみ反映＆rerun
+            with st.form(f"odds_form_{mid}", clear_on_submit=False):
+                c1, c2, c3, c4 = st.columns([1,1,1,0.6])
                 with c1:
-                    st.number_input("Home", min_value=1.0, step=0.1,
-                                    value=parse_float(od.get("home_win"), 1.0),
-                                    key=f"od_h_{mid}", disabled=not is_admin)
+                    home = st.number_input("Home", min_value=1.0, step=0.1,
+                                           value=parse_float(od.get("home_win"), 1.0),
+                                           key=f"od_h_{mid}", disabled=not is_admin)
                 with c2:
-                    st.number_input("Draw", min_value=1.0, step=0.1,
-                                    value=parse_float(od.get("draw"), 1.0),
-                                    key=f"od_d_{mid}", disabled=not is_admin)
+                    draw = st.number_input("Draw", min_value=1.0, step=0.1,
+                                           value=parse_float(od.get("draw"), 1.0),
+                                           key=f"od_d_{mid}", disabled=not is_admin)
                 with c3:
-                    st.number_input("Away", min_value=1.0, step=0.1,
-                                    value=parse_float(od.get("away_win"), 1.0),
-                                    key=f"od_a_{mid}", disabled=not is_admin)
+                    away = st.number_input("Away", min_value=1.0, step=0.1,
+                                           value=parse_float(od.get("away_win"), 1.0),
+                                           key=f"od_a_{mid}", disabled=not is_admin)
+                with c4:
+                    submitted = st.form_submit_button("保存", disabled=not is_admin, use_container_width=True)
 
-        # 送信後に一括保存
-        if submitted and is_admin:
-            saved = 0
-            for m in matches_raw:
-                mid = str(m["id"])
-                home = float(st.session_state.get(f"od_h_{mid}", 1.0))
-                draw = float(st.session_state.get(f"od_d_{mid}", 1.0))
-                away = float(st.session_state.get(f"od_a_{mid}", 1.0))
-                row = {
-                    "gw": gw,
-                    "match_id": mid,
-                    "home": m["home"],
-                    "away": m["away"],
-                    "home_win": f"{home}",
-                    "draw": f"{draw}",
-                    "away_win": f"{away}",
-                    "locked": "",
-                    "updated_at": datetime.utcnow().isoformat(timespec="seconds"),
-                }
-                upsert_row("odds", row, key_cols=["match_id", "gw"])
-                saved += 1
-            st.success(f"{saved} 試合分のオッズを保存しました。")
-            st.rerun()
-    # ---- フォームここまで ----
+                if submitted and is_admin:
+                    row = {
+                        "gw": gw,
+                        "match_id": mid,
+                        "home": m["home"],
+                        "away": m["away"],
+                        "home_win": str(home),
+                        "draw": str(draw),
+                        "away_win": str(away),
+                        "locked": "",
+                        "updated_at": datetime.utcnow().isoformat(timespec="seconds"),
+                    }
+                    upsert_row("odds", row, key_cols=["match_id", "gw"])
+                    st.success("保存しました。")
+                    st.rerun()
 
 # ------------------------------------------------------------
 # メイン
