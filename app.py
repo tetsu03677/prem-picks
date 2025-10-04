@@ -57,7 +57,6 @@ def parse_float(x, default=None):
 def _gw_sort_key(x):
     """GWの並び替え用：GW7 / 7 / None / '' が混在しても安全にソート"""
     s = "" if x is None else str(x).strip()
-    # 文字列中の最初の数字を拾って数値化。なければ大きめにして末尾へ。
     n = 999999
     num = ""
     for ch in s:
@@ -89,20 +88,24 @@ def get_users(conf: Dict[str, str]) -> List[Dict]:
         return [{"username": "guest", "password": "guest", "role": "user", "team": ""}]
 
 # ------------------------------------------------------------
-# 認証
+# 認証（ログイン後はフォームを完全に非表示）
 # ------------------------------------------------------------
 def login_ui(conf: Dict[str, str]) -> Dict:
     signed = st.session_state.get("signed_in") is True
     me = st.session_state.get("me")
 
-    card_class = "login-hidden" if signed and me else "app-card"
+    # すでにログイン済みなら UI を描画せず即返す
+    if signed and me:
+        return me
+
+    # 未ログイン時のみフォームを表示
     with st.container():
-        st.markdown(f'<div class="{card_class}">', unsafe_allow_html=True)
+        st.markdown('<div class="app-card">', unsafe_allow_html=True)
 
         st.markdown("## Premier Picks")
         users = get_users(conf)
         usernames = [u["username"] for u in users]
-        default_idx = max(0, usernames.index(me["username"])) if (signed and me and me["username"] in usernames) else 0
+        default_idx = 0
 
         c1, c2 = st.columns([1, 1])
         with c1:
@@ -119,9 +122,6 @@ def login_ui(conf: Dict[str, str]) -> Dict:
                 st.rerun()
             else:
                 st.warning("ユーザー名またはパスワードが違います。")
-
-        if signed and me:
-            st.success(f"ようこそ {me['username']} さん！")
 
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -240,7 +240,6 @@ def page_history(conf: Dict[str, str], me: Dict):
         st.info("履歴はまだありません。")
         return
 
-    # GW リストを安全に作成＆並び替え
     gw_vals = { (b.get("gw") if b.get("gw") not in (None, "") else "") for b in bets }
     gw_set = sorted(gw_vals, key=_gw_sort_key)
     sel_gw = st.selectbox("表示するGW", gw_set, index=0 if gw_set else None, key="hist_gw")
