@@ -1,377 +1,580 @@
 # app.py
+# --- Premier Picks (single-file main app) ---
+# 要件:
+# - ログイン: config.users_json からプルダウン。UIはシンプル。
+# - タブ: トップ / 試合とベット / 履歴 / リアルタイム / ダッシュボード / オッズ管理(管理者のみ)
+# - オッズ/ベットのロックは「当GWの最初の試合のキックオフ2時間前(=config.odds_freeze_minutes_before_first)」
+# - ロック後は「次GW」を7日先までで探索して表示。無ければ「7日以内に次節はありません」
+# - Football-Data API のトークンは config シートから読む（Secrets 非依存）
+# - Google Sheets 連携は Secrets の service account と sheet_id を使用（従来通り）
+# - DuplicateWidgetID を避けるため、全ウィジェットに match_id を含む key を付与
+
 import json
 from datetime import datetime, timedelta, timezone
-import pytz
+from dateutil import tz
 import streamlit as st
 
-from google_sheets_client import read_rows_by_sheet, upsert_row, read_config, now_str
-from football_api import fetch_matches_next_gw, fetch_matches_window
-from ui_parts import pill, section_header, muted, kpi, tag
+from google_sheets_client import read_config, read_rows_by_sheet, upsert_row
+from football_api import (
+    fetch_matches_current_gw,
+    fetch_matches_next_gw,
+    simplify_matches,
+    compute_gw_lock_threshold,
+    fetch_match_snapshots_by_ids,
+)
 
 APP_TITLE = "Premier Picks"
+
+# --- Page config は一番最初に ---
 st.set_page_config(page_title=APP_TITLE, page_icon="⚽", layout="wide")
 
-# ---------- helpers ----------
-def get_conf():
+# ---------- Utility ----------
+def get_conf() -> dict:
     rows = read_config()
-    conf = {r["key"]: r["value"] for r in rows}
-    # safety defaults
+    conf = {r["key"]: str(r["value"]).strip() for r in rows if r.get("key")}
+    # デフォルト
     conf.setdefault("timezone", "Asia/Tokyo")
-    conf.setdefault("current_gw", "GW0")
-    conf.setdefault("lock_minutes_before_earliest", "120")
+    conf.setdefault("current_gw", "GW1")
+    conf.setdefault("odds_freeze_minutes_before_first", "120")
     conf.setdefault("max_total_stake_per_gw", "5000")
     conf.setdefault("stake_step", "100")
-    conf.setdefault("FOOTBALL_DATA_COMPETITION", "PL")
-    conf.setdefault("API_FOOTBALL_SEASON", "2025")
+    conf.setdefault("FOOTBALL_DATA_COMPETITION", "PL")  # 'PL' でも '2021' でもOK
+    conf.setdefault("FOOTBALL_DATA_SEASON", "2025")
     return conf
 
-def get_users(conf):
+
+def parse_users(conf: dict):
+    raw = conf.get("users_json", "").strip()
     try:
-        users = json.loads(conf.get("users_json","[]"))
+        users = json.loads(raw) if raw else []
         assert isinstance(users, list)
         return users
     except Exception:
-        return [{"username":"guest","password":"", "role":"user","team":"-"}]
+        return []
 
-def tzaware(dt_utc, tzname):
-    tz = pytz.timezone(tzname)
-    return dt_utc.astimezone(tz)
 
-def gw_lock_threshold(matches_utc, lock_minutes):
-    # GW全体の最初の試合のキックオフの lock_minutes 前
-    if not matches_utc:
-        return None
-    first_kick = min(m["utc_kickoff"] for m in matches_utc)
-    return first_kick - timedelta(minutes=int(lock_minutes))
+def get_tz(conf: dict):
+    return tz.gettz(conf.get("timezone", "Asia/Tokyo"))
 
-def total_stake_used(bets, gw, user):
-    return sum(int(b["stake"]) for b in bets if b.get("gw")==gw and b.get("user")==user)
 
-def ensure_auth(conf):
-    st.markdown(f"### {APP_TITLE}")
-    users = get_users(conf)
+def money(n: float) -> str:
+    try:
+        return f"{int(n):,}"
+    except Exception:
+        return "0"
 
-    # セッション保持
-    if "me" not in st.session_state:
-        st.session_state.me = None
 
-    if st.session_state.me:
-        return st.session_state.me  # 既ログイン
+# ---------- Auth ----------
+def ensure_auth(conf: dict):
+    if "user" in st.session_state and st.session_state["user"]:
+        return st.session_state["user"]
 
-    if users and users[0].get("username") == "guest" and conf.get("users_json","").strip()=="":
-        st.warning("config の users_json が空です。※一時的に guest のみ表示しています。", icon="⚠️")
+    users = parse_users(conf)
+    if not users:
+        # フォールバック: guest のみ
+        users = [{"username": "guest", "password": "", "role": "user", "team": "-"}]
+        st.warning("config の users_json が空または不正です。暫定的に guest のみ表示しています。")
 
-    usernames = [u["username"] for u in users]
-    col = st.container()
-    with col:
-        user = st.selectbox("ユーザー", usernames, index=0, key="login_user")
-        pwd = st.text_input("パスワード", type="password")
-        if st.button("ログイン", use_container_width=True):
-            user_obj = next((u for u in users if u["username"]==user), None)
-            if user_obj and user_obj.get("password","")==pwd:
-                st.session_state.me = user_obj
-                st.success("ログインしました。")
-                st.rerun()
-            else:
-                st.error("ユーザー名またはパスワードが違います。")
+    st.markdown("### Premier Picks")
+    with st.container():
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            name = st.selectbox(
+                "ユーザー",
+                options=[u["username"] for u in users],
+                index=0,
+                key="login_username",
+            )
+            pwd = st.text_input("パスワード", type="password", key="login_password")
+            if st.button("ログイン", use_container_width=True):
+                user = next((u for u in users if u["username"] == name), None)
+                if user and (user.get("password", "") == pwd):
+                    st.session_state["user"] = user
+                    st.success(f"ようこそ {name} さん！")
+                    st.rerun()
+                else:
+                    st.error("ユーザー名またはパスワードが違います。")
     st.stop()
 
-def odds_row_default(gw, match_id, home, away):
-    return {
-        "gw": gw, "match_id": str(match_id), "home": home, "away": away,
-        "home_win": "", "draw": "", "away_win": "",
-        "locked": "", "updated_at": now_str()
-    }
 
-def read_odds_map_by_match_id():
-    odds = read_rows_by_sheet("odds")
-    out = {}
-    for r in odds:
-        out[str(r.get("match_id"))] = r
-    return out
+def logout_button():
+    with st.sidebar:
+        if st.button("ログアウト", type="secondary"):
+            st.session_state.pop("user", None)
+            st.rerun()
 
-def simplify_matches(raw, tzname):
-    tz = pytz.timezone(tzname)
-    out=[]
-    for m in raw:
-        out.append({
-            "id": str(m["id"]),
-            "gw": m["gw"],
-            "home": m["home"],
-            "away": m["away"],
-            "status": m["status"],
-            "utc_kickoff": m["utc_kickoff"],
-            "local_kickoff": m["utc_kickoff"].astimezone(tz),
-        })
-    return out
 
-# ---------- pages ----------
+# ---------- Sheets helpers ----------
+def read_odds_for_gw(gw: str):
+    odds_rows = read_rows_by_sheet("odds")
+    return [r for r in odds_rows if str(r.get("gw", "")).strip() == gw]
+
+
+def read_bets_for_gw(gw: str):
+    bets_rows = read_rows_by_sheet("bets")
+    return [r for r in bets_rows if str(r.get("gw", "")).strip() == gw]
+
+
+def upsert_bet(
+    gw: str,
+    username: str,
+    match_id: str,
+    match_label: str,
+    pick: str,
+    stake: int,
+    odds_value: float,
+):
+    key = f"{gw}-{match_id}-{username}"
+    upsert_row(
+        sheet_name="bets",
+        key_col="key",
+        key_val=key,
+        row_dict={
+            "key": key,
+            "gw": gw,
+            "user": username,
+            "match_id": str(match_id),
+            "match": match_label,
+            "pick": pick,
+            "stake": int(stake),
+            "odds": float(odds_value),
+            "placed_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            # 以下は読み取り計算派なので基本空欄のまま
+            "status": "",
+            "result": "",
+            "payout": "",
+            "net": "",
+            "settled_at": "",
+        },
+    )
+
+
+def upsert_odds(gw: str, match_id: str, home: str, away: str, h: float, d: float, a: float, locked: bool):
+    upsert_row(
+        sheet_name="odds",
+        key_col="match_id",
+        key_val=str(match_id),
+        row_dict={
+            "gw": gw,
+            "match_id": str(match_id),
+            "home": home,
+            "away": away,
+            "home_win": float(h),
+            "draw": float(d),
+            "away_win": float(a),
+            "locked": "1" if locked else "0",
+            "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        },
+    )
+
+
+# ---------- Pages ----------
 def page_home(me):
-    section_header("トップ")
-    muted("ここでは簡単なガイドだけを表示。実際の操作は上部タブから。")
-    st.write(f"ログイン中： **{me['username']} ({me.get('role','user')})**")
+    st.subheader("トップ")
+    st.info("ここでは簡単なガイドだけを表示。実際の操作は上部タブから。")
+    st.caption(f"ログイン中：**{me['username']}** ({me.get('role','user')})")
+
+
+def _load_current_or_next_matches(conf, tzinfo, me):
+    """現在のGW（ロック前）または、ロック済なら次GWを返す。"""
+    # 現在GWの候補を取得（最大7日先）
+    matches_raw, gw = fetch_matches_current_gw(conf, day_window=7)
+    matches = simplify_matches(matches_raw, tzinfo)
+
+    if not matches:
+        # そもそも7日以内に試合が無い
+        return [], gw, None, True
+
+    lock_threshold = compute_gw_lock_threshold(matches, conf, tzinfo)
+    now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+    is_locked = (now_utc >= lock_threshold) if lock_threshold else False
+
+    if not is_locked:
+        return matches, gw, lock_threshold, False
+
+    # ロック後 → 次GW（7日先まで）を探す
+    next_raw, next_gw = fetch_matches_next_gw(conf, day_window=7)
+    next_matches = simplify_matches(next_raw, tzinfo)
+    if not next_matches:
+        return [], next_gw, None, True
+    next_lock = compute_gw_lock_threshold(next_matches, conf, tzinfo)
+    return next_matches, next_gw, next_lock, False
+
 
 def page_matches_and_bets(conf, me):
-    section_header("試合とベット")
-    # 次節取得（7日以内 / なければ「7日以内に次節はありません」）
-    matches_raw, gw = fetch_matches_next_gw(conf, day_window=7)
-    if not matches_raw:
-        st.info("**7日以内に次節はありません。**")
-        return
+    st.subheader("試合とベット")
+    tzinfo = get_tz(conf)
 
-    tzname = conf.get("timezone","Asia/Tokyo")
-    matches = simplify_matches(matches_raw, tzname)
+    # GW試合リストの決定（ロック判定を含む）
+    matches, gw, lock_threshold, no_gw = _load_current_or_next_matches(conf, tzinfo, me)
 
-    # GWロック：最初の試合の2時間前固定（configのlock_minutes_before_earliest）
-    lock_thr = gw_lock_threshold([m for m in matches], conf.get("lock_minutes_before_earliest","120"))
-    locked = datetime.utcnow().replace(tzinfo=timezone.utc) >= lock_thr if lock_thr else False
-    st.write(tag("OPEN" if not locked else "LOCKED", "success" if not locked else "danger"),
-             muted(f" このGWのあなたの投票合計: {total_stake_used(read_rows_by_sheet('bets'), gw, me['username'])} / 上限 {conf.get('max_total_stake_per_gw','5000')}"))
+    # ユーザーの当GW投票合計
+    bets_rows_all = read_rows_by_sheet("bets")
+    my_gw_bets = [b for b in bets_rows_all if b.get("gw") == gw and b.get("user") == me["username"]]
+    my_total = sum(int(b.get("stake", 0) or 0) for b in my_gw_bets)
+    max_total = int(conf.get("max_total_stake_per_gw", "5000") or 5000)
+    st.caption(f"このGWのあなたの投票合計: **{money(my_total)}** / 上限 **{money(max_total)}** （残り **{money(max_total - my_total)}**）")
 
-    odds_map = read_odds_map_by_match_id()
-    bets = read_rows_by_sheet("bets")
-
-    for m in matches:
-        with st.container(border=True):
-            st.markdown(f"**{m['gw']}** ・ {m['local_kickoff'].strftime('%m/%d %H:%M')}")
-            st.markdown(f"**{m['home']}** vs {m['away']}")
-            # オッズ
-            o = odds_map.get(m["id"]) or odds_row_default(gw, m["id"], m["home"], m["away"])
-            if not (o["home_win"] and o["draw"] and o["away_win"]):
-                st.info("オッズ未入力のため **仮オッズ (=1.0)** を表示中。管理者は『オッズ管理』で設定してください。")
-
-            home_odds = float(o["home_win"] or 1.0)
-            draw_odds = float(o["draw"] or 1.0)
-            away_odds = float(o["away_win"] or 1.0)
-            st.write(muted(f"Home: {home_odds:.2f} ・ Draw: {draw_odds:.2f} ・ Away: {away_odds:.2f}"))
-
-            # 既存ベット
-            my_existing = next((b for b in bets if b.get("gw")==gw and b.get("user")==me["username"] and b.get("match_id")==m["id"]), None)
-            cur_pick = (my_existing or {}).get("pick", "AWAY")
-            cur_stake = int((my_existing or {}).get("stake", conf.get("stake_step","100")))
-            st.write(muted(f"現在のベット状況：HOME {0} / DRAW {0} / AWAY {0}"))
-
-            # 入力（ユニークキーで DuplicateWidgetID を回避）
-            pick = st.radio("ピック", options=["HOME","DRAW","AWAY"],
-                            index=["HOME","DRAW","AWAY"].index(cur_pick),
-                            horizontal=True, key=f"pick_{m['id']}")
-            step = int(conf.get("stake_step","100"))
-            stake = st.number_input("ステーク", min_value=step, max_value=int(conf.get("max_total_stake_per_gw","5000")),
-                                    value=cur_stake, step=step, key=f"stake_{m['id']}", label_visibility="visible")
-
-            col_b1, col_b2 = st.columns([1,1])
-            if col_b1.button("この内容でベット", key=f"bet_{m['id']}", disabled=locked):
-                # 上限チェック
-                used = total_stake_used(bets, gw, me["username"]) - (int(my_existing["stake"]) if my_existing else 0)
-                if used + stake > int(conf.get("max_total_stake_per_gw","5000")):
-                    st.error("このGWの上限を超えます。")
-                else:
-                    odds_used = {"HOME":home_odds,"DRAW":draw_odds,"AWAY":away_odds}[pick]
-                    row = {
-                        "key": f"{gw}-{me['username']}-{m['id']}",
-                        "gw": gw,
-                        "user": me["username"],
-                        "match_id": m["id"],
-                        "match": f"{m['home']} vs {m['away']}",
-                        "pick": pick,
-                        "stake": str(stake),
-                        "odds": f"{odds_used:.2f}",
-                        "placed_at": now_str(),
-                        "status": "OPEN",
-                        "result": "",
-                        "payout": "",
-                        "net": "",
-                        "settled_at": ""
-                    }
-                    upsert_row("bets", "key", row)
-                    st.success("ベットを記録しました。")
-                    st.rerun()
-
-            if col_b2.button("ベットを取り消す", key=f"del_{m['id']}", disabled=(locked or my_existing is None)):
-                upsert_row("bets", "key", {"key": f"{gw}-{me['username']}-{m['id']}", "_delete": True})
-                st.success("ベットを取り消しました。")
-                st.rerun()
-
-def page_history(me):
-    section_header("履歴")
-    bets = read_rows_by_sheet("bets")
-    my = [b for b in bets if b.get("user")==me["username"]]
-    if not my:
-        st.info("まだ履歴がありません。")
-        return
-    # 表示用
-    cols = st.columns([2,2,1,1,1,1,1,1])
-    headers = ["GW","試合","ピック","Stake","Odds","Result","Payout","Net"]
-    for c,h in zip(cols,headers): c.write(f"**{h}**")
-    for b in sorted(my, key=lambda x: (x.get("gw",""), x.get("match",""))):
-        c = st.columns([2,2,1,1,1,1,1,1])
-        c[0].write(b.get("gw",""))
-        c[1].write(b.get("match",""))
-        c[2].write(b.get("pick",""))
-        c[3].write(b.get("stake",""))
-        c[4].write(b.get("odds",""))
-        c[5].write(b.get("result",""))
-        c[6].write(b.get("payout",""))
-        c[7].write(b.get("net",""))
-
-def page_realtime(conf):
-    section_header("リアルタイム")
-    st.caption("※自動更新は行いません。必要なときに『最新化』を押してください。")
-    if st.button("最新化", type="primary"):
-        st.rerun()
-
-    matches_raw, gw = fetch_matches_next_gw(conf, day_window=7, accept_today=True, include_live=True)
-    if not matches_raw:
-        st.info("対象期間に試合はありません。")
-        return
-
-    tzname = conf.get("timezone","Asia/Tokyo")
-    matches = simplify_matches(matches_raw, tzname)
-    odds_map = read_rows_by_sheet("odds")
-    odds_by_id = {str(o["match_id"]):o for o in odds_map}
-    bets = read_rows_by_sheet("bets")
-
-    # 試合ごとの時点収支（読み取り計算）
-    for m in matches:
-        with st.container(border=True):
-            st.markdown(f"**{m['gw']}** ・ {m['local_kickoff'].strftime('%m/%d %H:%M')} ・ 状態：{m['status']}")
-            st.markdown(f"**{m['home']}** vs {m['away']}")
-            o = odds_by_id.get(m["id"], {})
-            home_odds = float(o.get("home_win") or 1.0)
-            draw_odds = float(o.get("draw") or 1.0)
-            away_odds = float(o.get("away_win") or 1.0)
-            st.write(muted(f"Home {home_odds:.2f} / Draw {draw_odds:.2f} / Away {away_odds:.2f}"))
-
-            # ここでは実スコアをAPIから持ってきて判定…（簡易：LIVE/TIMEDは未確定, FINISHEDは確定）
-            tbl = []
-            for b in [x for x in bets if x.get("match_id")==m["id"]]:
-                stake = int(b.get("stake","0") or 0)
-                pick = b.get("pick")
-                odds_used = {"HOME":home_odds,"DRAW":draw_odds,"AWAY":away_odds}[pick]
-                payout_est = stake * odds_used if m["status"] in ("FINISHED","IN_PLAY","PAUSED") and pick else 0.0
-                tbl.append((b["user"], pick, stake, odds_used, payout_est))
-            if tbl:
-                col = st.columns([2,1,1,1,1])
-                for w,h in zip(col,["User","Pick","Stake","Odds","Est.Payout"]): w.write(f"**{h}**")
-                for r in tbl:
-                    c = st.columns([2,1,1,1,1])
-                    for i,v in enumerate(r): c[i].write(v)
-            else:
-                st.write(muted("ベットはまだありません。"))
-
-def page_odds_admin(conf, me):
-    if me.get("role")!="admin":
-        st.info("管理者のみアクセスできます。")
-        return
-    section_header("オッズ管理")
-    matches_raw, gw = fetch_matches_next_gw(conf, day_window=7)
-    if not matches_raw:
+    if no_gw:
         st.info("7日以内に次節はありません。")
         return
-    tzname = conf.get("timezone","Asia/Tokyo")
-    matches = simplify_matches(matches_raw, tzname)
-    odds_map = read_odds_map_by_match_id()
 
+    # ロック表示（GW 全体で1箇所だけ）
+    if lock_threshold:
+        now = datetime.utcnow().replace(tzinfo=timezone.utc)
+        locked = now >= lock_threshold
+        st.success("OPEN", icon="✅") if not locked else st.error("LOCKED", icon="🔒")
+        st.caption(f"ロック基準時刻（最初の試合の {conf.get('odds_freeze_minutes_before_first','120')} 分前・UTC基準）：{lock_threshold.isoformat()}")
+
+    # 当GWのオッズ行を読み込み
+    odds_rows = read_odds_for_gw(gw)
+    odds_by_id = {str(r.get("match_id")): r for r in odds_rows}
+
+    # 試合カード
     for m in matches:
-        with st.container(border=True):
-            st.markdown(f"**{m['gw']}** ・ {m['local_kickoff'].strftime('%m/%d %H:%M')}")
-            st.markdown(f"**{m['home']}** vs {m['away']}")
-            o = odds_map.get(m["id"]) or odds_row_default(m["gw"], m["id"], m["home"], m["away"])
-            col1, col2, col3 = st.columns(3)
-            hv = col1.number_input("Home", value=float(o["home_win"] or 1.0), step=0.01, key=f"h_{m['id']}")
-            dv = col2.number_input("Draw", value=float(o["draw"] or 1.0), step=0.01, key=f"d_{m['id']}")
-            av = col3.number_input("Away", value=float(o["away_win"] or 1.0), step=0.01, key=f"a_{m['id']}")
-            if st.button("保存", key=f"save_{m['id']}"):
-                row = {
-                    "gw": m["gw"], "match_id": m["id"], "home": m["home"], "away": m["away"],
-                    "home_win": f"{hv:.2f}", "draw": f"{dv:.2f}", "away_win": f"{av:.2f}",
-                    "locked": "", "updated_at": now_str()
-                }
-                upsert_row("odds","match_id",row)
-                st.success("保存しました。")
-                st.rerun()
+        mid = str(m["id"])
+        home = m["home"]
+        away = m["away"]
+        kickoff_local = m["local_kickoff"]
+        status = m["status"]
+        gw_label = m.get("gw", gw)
 
-def page_dashboard(conf):
-    section_header("ダッシュボード")
-    bets = read_rows_by_sheet("bets")
+        card = st.container(border=True)
+        with card:
+            st.markdown(f"**{gw_label}** ・ {kickoff_local.strftime('%m/%d %H:%M')}")
+            # タイトル（ホーム太字・やや大きめ）
+            st.markdown(f"<div style='font-size:1.05rem'><b>{home}</b> vs {away}</div>", unsafe_allow_html=True)
+
+            # オッズ
+            o = odds_by_id.get(mid, {})
+            h = float(o.get("home_win", 1) or 1)
+            d = float(o.get("draw", 1) or 1)
+            a = float(o.get("away_win", 1) or 1)
+            show_temp = (o == {})
+            if show_temp:
+                st.info("オッズ未入力のため仮オッズ(=1.0) を表示中。管理者は『オッズ管理』で設定してください。")
+            st.caption(f"Home: {h:.2f} ・ Draw: {d:.2f} ・ Away: {a:.2f}")
+
+            # 現在のベット集計（他ユーザー含む）
+            match_bets = [b for b in bets_rows_all if b.get("gw")==gw and str(b.get("match_id"))==mid]
+            sum_home = sum(int(b.get("stake",0) or 0) for b in match_bets if (b.get("pick")=="HOME"))
+            sum_draw = sum(int(b.get("stake",0) or 0) for b in match_bets if (b.get("pick")=="DRAW"))
+            sum_away = sum(int(b.get("stake",0) or 0) for b in match_bets if (b.get("pick")=="AWAY"))
+            st.caption(f"現在のベット状況： HOME {money(sum_home)} / DRAW {money(sum_draw)} / AWAY {money(sum_away)}")
+
+            # ロック判定（GWベース）
+            gw_locked = False
+            if lock_threshold:
+                gw_locked = datetime.utcnow().replace(tzinfo=timezone.utc) >= lock_threshold
+
+            # 既存ベット（自分）
+            my_bet = next((b for b in match_bets if b.get("user")==me["username"]), None)
+            default_pick = my_bet.get("pick") if my_bet else "HOME"
+            default_stake = int(my_bet.get("stake", conf.get("stake_step","100")) or 0) if my_bet else int(conf.get("stake_step","100") or 100)
+
+            # ピック
+            pick = st.radio(
+                "ピック",
+                options=["HOME", "DRAW", "AWAY"],
+                index=["HOME","DRAW","AWAY"].index(default_pick) if default_pick in ("HOME","DRAW","AWAY") else 0,
+                horizontal=True,
+                key=f"pick_{mid}",
+                disabled=gw_locked,
+            )
+            # ステーク
+            stake = st.number_input(
+                "ステーク",
+                step=int(conf.get("stake_step","100") or 100),
+                min_value=0,
+                value=max(0, default_stake),
+                key=f"stake_{mid}",
+                disabled=gw_locked,
+            )
+
+            # 送信
+            if st.button("この内容でベット", key=f"bet_{mid}", disabled=gw_locked):
+                # 上限チェック（当GWトータル）
+                already = sum(int(b.get("stake",0) or 0) for b in my_gw_bets if b.get("match_id")!=mid)
+                if already + int(stake) > max_total:
+                    st.error("当GWの投票合計が上限を超えます。ステークを調整してください。")
+                else:
+                    upsert_bet(
+                        gw=gw,
+                        username=me["username"],
+                        match_id=mid,
+                        match_label=f"{home} vs {away}",
+                        pick=pick,
+                        stake=int(stake),
+                        odds_value=h if pick=="HOME" else d if pick=="DRAW" else a,
+                    )
+                    st.success("ベットを記録しました！")
+                    st.rerun()
+
+
+def _calc_result_from_score(score_dict):
+    """Football-Data v4 の score から 'HOME' | 'DRAW' | 'AWAY' | '' を返す"""
+    try:
+        ft = score_dict.get("fullTime") or {}
+        h = ft.get("home")
+        a = ft.get("away")
+        if h is None or a is None:
+            return ""
+        if h > a:
+            return "HOME"
+        if a > h:
+            return "AWAY"
+        return "DRAW"
+    except Exception:
+        return ""
+
+
+def page_history(conf, me):
+    st.subheader("履歴")
+    # bets から存在する GW を拾って選択
+    all_bets = read_rows_by_sheet("bets")
+    gw_list = sorted(list({b.get("gw","") for b in all_bets if b.get("gw")}), key=lambda x: (len(x), x))
+    if not gw_list:
+        st.info("まだベット履歴がありません。")
+        return
+    gw = st.selectbox("ゲームウィークを選択", options=gw_list, index=len(gw_list)-1)
+    bets = [b for b in all_bets if b.get("gw")==gw]
+
     if not bets:
-        st.info("データがまだありません。")
+        st.info("選択したGWのベットはありません。")
         return
 
-    # KPI（読み取り計算）
-    total_stake = sum(int(b.get("stake","0") or 0) for b in bets)
-    total_payout = sum(float(b.get("payout") or 0) for b in bets if b.get("payout"))
-    total_net = sum(float(b.get("net") or 0) for b in bets if b.get("net"))
+    # 対象試合のスコアを取得 → 読み取り計算で payout/net を算出
+    ids = list({str(b.get("match_id")) for b in bets if b.get("match_id")})
+    snapshots = fetch_match_snapshots_by_ids(conf, ids)
+    snap_by_id = {str(s["id"]): s for s in snapshots}
 
-    c1,c2,c3,c4 = st.columns(4)
-    kpi(c1, "総投票額", f"{int(total_stake):,}")
-    kpi(c2, "総払戻", f"{total_payout:,.0f}")
-    kpi(c3, "総損益", f"{total_net:,.0f}")
-    kpi(c4, "ブックメーカー役", conf.get("bookmaker_username","-"))
-
-    st.markdown("#### ユーザー別損益（当GW・暫定）")
-    gw = conf.get("current_gw","")
-    gw_bets = [b for b in bets if b.get("gw")==gw]
-    if gw_bets:
-        users = {}
-        for b in gw_bets:
-            u = b["user"]
-            stake = int(b.get("stake","0") or 0)
-            net = float(b.get("net") or 0)
-            users.setdefault(u, {"stake":0,"net":0})
-            users[u]["stake"] += stake
-            users[u]["net"] += net
-        cc = st.columns([2,1,1])
-        for w,h in zip(cc,["User","Stake","Net"]): w.write(f"**{h}**")
-        for u,rec in sorted(users.items(), key=lambda x: x[1]["net"], reverse=True):
-            c = st.columns([2,1,1]); c[0].write(u); c[1].write(rec["stake"]); c[2].write(f"{rec['net']:.0f}")
-    else:
-        st.write(muted("当GWのデータなし。"))
-
-    st.markdown("#### ユーザーごとの『得意チーム』ランキング（通算）")
-    # pick=HOME/DRAW/AWAY のとき、「予想チーム」は HOMEならhomeチーム、AWAYならawayチーム、DRAWは除外
-    best = {}  # user -> list of (team, played, win_rate, net)
+    # 集計
+    rows = []
+    total_net_by_user = {}
     for b in bets:
-        if b.get("result") not in ("WIN","LOSE"):
-            continue
-        if b.get("pick")=="DRAW":
-            continue
-        team = (b["match"].split(" vs ")[0] if b["pick"]=="HOME" else b["match"].split(" vs ")[1])
-        user = b["user"]
-        won = 1 if b["result"]=="WIN" else 0
-        net = float(b.get("net") or 0)
-        best.setdefault(user, {})
-        rec = best[user].setdefault(team, {"played":0,"win":0,"net":0.0})
-        rec["played"] += 1
-        rec["win"] += won
-        rec["net"] += net
+        mid = str(b.get("match_id"))
+        snap = snap_by_id.get(mid, {})
+        result = _calc_result_from_score(snap.get("score", {})) if snap else ""
+        won = (result == b.get("pick")) if result else None  # None=未確定
+        stake = int(b.get("stake",0) or 0)
+        odds_val = float(b.get("odds",1) or 1)
 
-    cols = st.columns([2,3])
-    for user, teams in best.items():
-        rows=[]
-        for t, r in teams.items():
-            win_rate = r["win"]/r["played"] if r["played"] else 0
-            rows.append((t, r["played"], f"{win_rate:.0%}", f"{r['net']:.0f}"))
-        rows.sort(key=lambda x: (float(x[2].strip('%')), float(x[3])), reverse=True)
-        with st.expander(f"{user} の得意チーム TOP5"):
-            c = st.columns([2,1,1,1])
-            for w,h in zip(c,["Team","試行","勝率","損益"]): w.write(f"**{h}**")
-            for r in rows[:5]:
-                cc = st.columns([2,1,1,1])
-                for i,v in enumerate(r): cc[i].write(v)
+        payout = stake * odds_val if won else (0 if won is not None else None)
+        net = (payout - stake) if won is not None else None
 
-# ---------- main ----------
+        rows.append({
+            "user": b.get("user"),
+            "match": b.get("match"),
+            "pick": b.get("pick"),
+            "stake": stake,
+            "odds": odds_val,
+            "result": result or "-",
+            "payout": "" if payout is None else int(payout),
+            "net": "" if net is None else int(net),
+        })
+        if net is not None:
+            total_net_by_user[b.get("user")] = total_net_by_user.get(b.get("user"), 0) + int(net)
+
+    st.write("### ユーザー別損益（確定分）")
+    if total_net_by_user:
+        st.table({u: money(v) for u, v in sorted(total_net_by_user.items(), key=lambda x: -x[1])})
+    else:
+        st.caption("まだ確定した試合がありません。")
+
+    st.write("### 明細（読み取り計算）")
+    st.dataframe(rows, use_container_width=True)
+
+
+def page_realtime(conf, me):
+    st.subheader("リアルタイム（手動更新）")
+    tzinfo = get_tz(conf)
+
+    # 現在GWを取得（ロック有無に関わらず「今節」）
+    current_raw, gw = fetch_matches_current_gw(conf, day_window=7)
+    matches = simplify_matches(current_raw, tzinfo)
+    if not matches:
+        st.info("7日以内に対象試合がありません。")
+        return
+
+    # 手動更新ボタン
+    if st.button("更新", icon="🔄"):
+        st.rerun()
+
+    # このGWの bets と スコア
+    ids = [str(m["id"]) for m in matches]
+    snaps = fetch_match_snapshots_by_ids(conf, ids)
+    snap_by_id = {str(s["id"]): s for s in snaps}
+    bets = read_bets_for_gw(gw)
+
+    # 試合単位の時点損益
+    user_pnl = {}
+    match_rows = []
+    for m in matches:
+        mid = str(m["id"])
+        s = snap_by_id.get(mid, {})
+        score = s.get("score", {})
+        status = s.get("status", m.get("status"))
+
+        # 現在の暫定勝敗
+        res = _calc_result_from_score(score)
+
+        # この試合のベット
+        bs = [b for b in bets if str(b.get("match_id")) == mid]
+        sum_by_pick = {"HOME":0, "DRAW":0, "AWAY":0}
+        for b in bs:
+            pick = b.get("pick")
+            stake = int(b.get("stake",0) or 0)
+            odds_val = float(b.get("odds",1) or 1)
+            sum_by_pick[pick] = sum_by_pick.get(pick,0) + stake
+
+            # 暫定損益
+            if res:
+                won = (pick == res)
+                pnl = stake * (odds_val - 1) if won else -stake
+                user_pnl[b.get("user")] = user_pnl.get(b.get("user"), 0) + pnl
+
+        match_rows.append({
+            "kickoff": m["local_kickoff"].strftime("%m/%d %H:%M"),
+            "match": f"{m['home']} vs {m['away']}",
+            "status": status,
+            "score_ft": f"{(score.get('fullTime') or {}).get('home','-')} - {(score.get('fullTime') or {}).get('away','-')}",
+            "now_pot_HOME": sum_by_pick["HOME"],
+            "now_pot_DRAW": sum_by_pick["DRAW"],
+            "now_pot_AWAY": sum_by_pick["AWAY"],
+            "provisional_result": res or "-",
+        })
+
+    st.write("### 試合別（現在）")
+    st.dataframe(match_rows, use_container_width=True)
+
+    st.write("### ユーザー別（現在の暫定損益）")
+    if user_pnl:
+        st.table({u: money(int(v)) for u, v in sorted(user_pnl.items(), key=lambda x: -x[1])})
+    else:
+        st.caption("まだ暫定損益はありません。")
+
+
+def page_dashboard(conf, me):
+    st.subheader("ダッシュボード")
+    # 全 bets を読み、確定済みを Football-Data の最終スコアで読み取り計算
+    all_bets = read_rows_by_sheet("bets")
+    # 対象試合のスナップショット
+    ids = list({str(b.get("match_id")) for b in all_bets if b.get("match_id")})
+    snaps = fetch_match_snapshots_by_ids(conf, ids)
+    snap_by_id = {str(s["id"]): s for s in snaps}
+
+    total_net_by_user = {}
+    team_hit_by_user = {}  # {user: {team: {"count":x,"net":y}}}
+
+    for b in all_bets:
+        mid = str(b.get("match_id"))
+        s = snap_by_id.get(mid, {})
+        result = _calc_result_from_score(s.get("score", {})) if s else ""
+        if not result:
+            continue  # 確定のみKPI
+        pick = b.get("pick")
+        stake = int(b.get("stake",0) or 0)
+        odds_val = float(b.get("odds",1) or 1)
+        won = (pick == result)
+        net = stake * (odds_val - 1) if won else -stake
+
+        user = b.get("user")
+        total_net_by_user[user] = total_net_by_user.get(user, 0) + int(net)
+
+        # チーム別 当たりランキング
+        # 試合情報（team は pick側のチーム名とする）
+        match_label = b.get("match", "")
+        # "HomeTeam vs AwayTeam" -> pick側チーム名を抽出
+        team = None
+        if " vs " in match_label:
+            home, away = match_label.split(" vs ", 1)
+            team = home if pick=="HOME" else away if pick=="AWAY" else "DRAW"
+        team_hit_by_user.setdefault(user, {})
+        team_hit_by_user[user].setdefault(team, {"count":0, "net":0})
+        team_hit_by_user[user][team]["count"] += 1
+        team_hit_by_user[user][team]["net"] += int(net)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.write("#### 通算損益（確定分）")
+        if total_net_by_user:
+            st.table({u: money(v) for u, v in sorted(total_net_by_user.items(), key=lambda x: -x[1])})
+        else:
+            st.caption("まだ確定データがありません。")
+
+    with c2:
+        st.write("#### あなたの当たりやすいチーム（Top5）")
+        mine = team_hit_by_user.get(me["username"], {})
+        if not mine:
+            st.caption("まだ実績がありません。")
+        else:
+            top = sorted(mine.items(), key=lambda x: (-x[1]["net"], -x[1]["count"]))[:5]
+            st.table([{ "team": t or "-", "bets": v["count"], "net": money(v["net"]) } for t, v in top])
+
+
+def page_odds_admin(conf, me):
+    st.subheader("オッズ管理（管理者）")
+    if me.get("role") != "admin":
+        st.warning("管理者のみ利用できます。")
+        return
+
+    tzinfo = get_tz(conf)
+    matches, gw, lock_threshold, no_gw = _load_current_or_next_matches(conf, tzinfo, me)
+
+    if no_gw:
+        st.info("7日以内に編集対象のGWがありません。")
+        return
+
+    gw_locked = False
+    if lock_threshold:
+        gw_locked = datetime.utcnow().replace(tzinfo=timezone.utc) >= lock_threshold
+
+    st.caption(f"対象GW: {gw}")
+    st.success("OPEN", icon="✅") if not gw_locked else st.error("LOCKED", icon="🔒")
+    if gw_locked:
+        st.caption("ロック中は編集できません。")
+
+    # 既存オッズ
+    odds_by_id = {str(o.get("match_id")): o for o in read_odds_for_gw(gw)}
+
+    for m in matches:
+        mid = str(m["id"])
+        home = m["home"]
+        away = m["away"]
+
+        with st.container(border=True):
+            st.markdown(f"**{home}** vs {away}")
+            old = odds_by_id.get(mid, {})
+            h = st.number_input("Home", min_value=1.0, step=0.01, value=float(old.get("home_win", 1) or 1), key=f"odd_h_{mid}", disabled=gw_locked)
+            d = st.number_input("Draw", min_value=1.0, step=0.01, value=float(old.get("draw", 1) or 1), key=f"odd_d_{mid}", disabled=gw_locked)
+            a = st.number_input("Away", min_value=1.0, step=0.01, value=float(old.get("away_win", 1) or 1), key=f"odd_a_{mid}", disabled=gw_locked)
+
+            if st.button("保存", key=f"save_{mid}", disabled=gw_locked):
+                upsert_odds(gw, mid, home, away, h, d, a, locked=gw_locked)
+                st.success("保存しました！")
+                st.rerun()
+
+
+# ---------- Main ----------
 def main():
     conf = get_conf()
     me = ensure_auth(conf)
+    logout_button()
 
-    tabs = st.tabs(["🏠 トップ","🎯 試合とベット","📁 履歴","⏱️ リアルタイム","📊 ダッシュボード","🛠 オッズ管理"])
-    with tabs[0]: page_home(me)
-    with tabs[1]: page_matches_and_bets(conf, me)
-    with tabs[2]: page_history(me)
-    with tabs[3]: page_realtime(conf)
-    with tabs[4]: page_dashboard(conf)
-    with tabs[5]: page_odds_admin(conf, me)
+    tabs = st.tabs(["🏠 トップ", "🎯 試合とベット", "📁 履歴", "⏱️ リアルタイム", "📊 ダッシュボード", "🛠 オッズ管理"])
+    with tabs[0]:
+        page_home(me)
+    with tabs[1]:
+        page_matches_and_bets(conf, me)
+    with tabs[2]:
+        page_history(conf, me)
+    with tabs[3]:
+        page_realtime(conf, me)
+    with tabs[4]:
+        page_dashboard(conf, me)
+    with tabs[5]:
+        page_odds_admin(conf, me)
+
 
 if __name__ == "__main__":
     main()
