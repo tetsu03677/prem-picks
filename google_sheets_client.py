@@ -1,92 +1,103 @@
 # google_sheets_client.py
 from __future__ import annotations
 
-import json
-from typing import Dict, List, Optional
-import streamlit as st
 import gspread
-from google.oauth2.service_account import Credentials
-from datetime import datetime, timezone
+import streamlit as st
 
-# ---- GSpread クライアント -------------------------------------------------
+# シート名固定
+SHEET_CONFIG = "config"
+SHEET_ODDS = "odds"
+SHEET_BETS = "bets"
 
-@st.cache_resource(show_spinner=False)
+# ------------------------------------------------------------
+# 内部：クライアント生成
+# ------------------------------------------------------------
+@st.cache_resource
 def _client() -> gspread.Client:
-    """
-    Secrets のサービスアカウント情報から gspread.Client を生成。
-    """
-    info = st.secrets.get("gcp_service_account")
-    if not info:
-        raise RuntimeError("Secrets[gcp_service_account] が設定されていません。")
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive.readonly",
-    ]
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
-    return gspread.authorize(creds)
+    creds = st.secrets["gcp_service_account"]
+    gc = gspread.service_account_from_dict(creds)
+    return gc
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource
 def _spreadsheet():
-    ssid = st.secrets.get("sheets", {}).get("sheet_id")
-    if not ssid:
-        raise RuntimeError("Secrets[sheets.sheet_id] が設定されていません。")
-    return _client().open_by_key(ssid)
+    gc = _client()
+    ssid = st.secrets["sheets"]["sheet_id"]
+    return gc.open_by_key(ssid)
 
 def ws(sheet_name: str):
-    return _spreadsheet().worksheet(sheet_name)
+    sh = _spreadsheet()
+    return sh.worksheet(sheet_name)
 
-# ---- 読み書きユーティリティ -----------------------------------------------
-
-def _records(w) -> List[Dict]:
-    """
-    ヘッダ行をキーにしたレコード配列を返す（空シートでも空配列）。
-    """
+# ------------------------------------------------------------
+# 便利関数
+# ------------------------------------------------------------
+def _records(ws_) -> list[dict]:
     try:
-        values = w.get_all_records()
-    except gspread.exceptions.APIError:
-        values = []
-    return values or []
+        return ws_.get_all_records()
+    except Exception:
+        return []
 
-def read_rows_by_sheet(sheet_name: str) -> List[Dict]:
+def read_rows_by_sheet(sheet_name: str) -> list[dict]:
     return _records(ws(sheet_name))
 
-def read_config() -> Dict[str, str]:
-    """
-    config シート => {key: value}
-    """
-    data = read_rows_by_sheet("config")
-    conf = {str(r.get("key", "")).strip(): str(r.get("value", "")).strip() for r in data if r.get("key")}
-    return conf
+def read_config_map() -> dict:
+    rows = read_rows_by_sheet(SHEET_CONFIG)
+    mp = {}
+    for r in rows:
+        k = str(r.get("key", "")).strip()
+        v = str(r.get("value", "")).strip()
+        if k:
+            mp[k] = v
+    return mp
 
-def _header_index_map(w) -> Dict[str, int]:
-    header = w.row_values(1)
-    return {name: idx+1 for idx, name in enumerate(header)}
-
-def upsert_row(sheet_name: str, key_value: str, row_dict: Dict[str, object], key_col: str = "key") -> None:
-    """
-    key_col が一致する行を更新。無ければ末尾に挿入。
-    ヘッダに存在しないキーは無視、欠損列は空で埋める。
-    """
-    w = ws(sheet_name)
-    header_map = _header_index_map(w)
-    # 探索
-    cell = None
+def _find_row_idx_by_key(worksheet, key: str, key_col: str = "key"):
+    # 1行目ヘッダ前提、対象列のインデックスを特定
+    header = worksheet.row_values(1)
     try:
-        cell = w.find(key_value, in_column=header_map.get(key_col, 1))
-    except Exception:
-        cell = None
+        idx = header.index(key_col) + 1
+    except ValueError:
+        # key_col が存在しない場合は失敗
+        return None
+    # 2行目以降を探索
+    col_vals = worksheet.col_values(idx)
+    for i, val in enumerate(col_vals[1:], start=2):
+        if str(val) == str(key):
+            return i
+    return None
 
-    # 行データをヘッダ順に整形
-    max_col = max(header_map.values()) if header_map else 0
-    row = ["" for _ in range(max_col)]
-    for col_name, col_idx in header_map.items():
-        if col_name in row_dict:
-            row[col_idx-1] = row_dict[col_name]
+def _header_index_map(worksheet):
+    header = worksheet.row_values(1)
+    return {h: i for i, h in enumerate(header, start=1)}
 
-    if cell:
-        w.update(f"A{cell.row}:{gspread.utils.rowcol_to_a1(cell.row, max_col).rstrip(str(cell.row))}", [row])
+def upsert_row(sheet_name: str, row: dict, key_col: str | None = None, key_cols: list[str] | None = None):
+    """
+    単一キー（key_col）または複合キー（key_cols）で upsert。
+    見つかれば更新、なければ末尾に追加。
+    """
+    ws_ = ws(sheet_name)
+    header_map = _header_index_map(ws_)
+
+    # 書き込む行データ（ヘッダ順に並べる）
+    values = [""] * len(header_map)
+    for col_name, idx in header_map.items():
+        values[idx - 1] = str(row.get(col_name, ""))
+
+    target_row = None
+
+    if key_col:
+        row_idx = _find_row_idx_by_key(ws_, str(row.get(key_col, "")), key_col=key_col)
+        if row_idx:
+            target_row = row_idx
+
+    if key_cols:
+        # 全行を読み、複合キー一致を探す
+        all_rows = ws_.get_all_records()
+        for i, r in enumerate(all_rows, start=2):
+            if all(str(r.get(k, "")) == str(row.get(k, "")) for k in key_cols):
+                target_row = i
+                break
+
+    if target_row:
+        ws_.update(f"A{target_row}:{chr(ord('A') + len(values) - 1)}{target_row}", [values])
     else:
-        w.append_row(row, value_input_option="USER_ENTERED")
-
-def now_iso_utc() -> str:
-    return datetime.now(timezone.utc).isoformat()
+        ws_.append_row(values, value_input_option="USER_ENTERED")
