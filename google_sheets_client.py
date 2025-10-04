@@ -10,7 +10,6 @@ import streamlit as st
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 JST = timezone(timedelta(hours=9))
 
-# 1→A, 26→Z, 27→AA...
 def _col_label(n: int) -> str:
     s = ""
     while n > 0:
