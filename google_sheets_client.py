@@ -1,5 +1,4 @@
 import json
-import time
 from typing import Dict, List, Any, Optional
 
 import gspread
@@ -9,9 +8,7 @@ import streamlit as st
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 def _client() -> gspread.Client:
-    # Secrets からサービスアカウント情報を読む（\n を含んだ鍵にも対応）
     info = dict(st.secrets["gcp_service_account"])
-    # safety: private_key は toml で \n を含む。余計な置換はしないが、改行無しで入った場合もケア
     pk = info.get("private_key", "")
     if "\\n" in pk and "\n" not in pk:
         info["private_key"] = pk.replace("\\n", "\n")
@@ -25,7 +22,6 @@ def ws(sheet_name: str):
     return sh.worksheet(sheet_name)
 
 def _records(worksheet) -> List[Dict[str, Any]]:
-    # 先頭行をヘッダとして records を返す
     return worksheet.get_all_records()
 
 def read_rows_by_sheet(sheet_name: str) -> List[Dict[str, Any]]:
@@ -42,24 +38,21 @@ def read_config() -> Dict[str, str]:
     return kv
 
 def upsert_row(sheet_name: str, key_field: str, key_value: Any, row_data: Dict[str, Any]) -> None:
-    """key_field 列の一致で upsert（odds/bets 管理に使用）"""
     w = ws(sheet_name)
     headers = w.row_values(1)
     key_col_idx = headers.index(key_field) + 1
-    # 全データを取って該当行を探す
     all_vals = w.get_all_values()
     target_row = None
     for i in range(2, len(all_vals) + 1):
-        if str(w.cell(i, key_col_idx).value) == str(key_value):
+        cell_val = w.cell(i, key_col_idx).value
+        if str(cell_val) == str(key_value):
             target_row = i
             break
-    # ヘッダ↔値の並びで row_values を作る
     values_row = [row_data.get(h, "") for h in headers]
     if target_row is None:
-        # 末尾に追加
         w.append_row(values_row)
     else:
-        # 既存行を更新
+        import gspread
         rng = gspread.utils.rowcol_to_a1(target_row, 1) + ":" + gspread.utils.rowcol_to_a1(target_row, len(headers))
         w.update(rng, [values_row])
 
@@ -70,7 +63,6 @@ def append_row(sheet_name: str, row_data: Dict[str, Any]) -> None:
     w.append_row(values_row)
 
 def read_odds_map_by_match_id(gw: str) -> Dict[str, Dict[str, Any]]:
-    """odds シートから当該 GW のレコードを match_id -> row dict で返す"""
     odds_rows = read_rows_by_sheet("odds")
     m = {}
     for r in odds_rows:
@@ -84,18 +76,15 @@ def upsert_odds(gw: str, match_id: str, home: str, draw: str, away: str, locker:
     data = {
         "gw": gw,
         "match_id": match_id,
-        "home": home,
-        "away": "",  # シートの見出し順に合わせる
-        "home_win": home,    # 互換
+        "home": "",                 # 見出し互換フィールド（未使用だが残す）
+        "away": "",                 # 見出し互換フィールド（未使用だが残す）
+        "home_win": home,
         "draw": draw,
         "away_win": away,
         "locked": "",
         "updated_at": locker,
     }
-    # odds シートの見出しが [gw,match_id,home,away,home_win,draw,away_win,locked,updated_at] の想定
-    # upsert は match_id で行う
     upsert_row("odds", "match_id", match_id, data)
 
 def upsert_bet(row: Dict[str, Any]) -> None:
-    """bets シートに key で upsert。 key は {gw}-{user}-{match_id}"""
     upsert_row("bets", "key", row["key"], row)
