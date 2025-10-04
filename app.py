@@ -397,7 +397,7 @@ def page_realtime(conf: Dict[str, str], me: Dict):
         f"""
         <div class="kpi-row">
           <div class="kpi"><div class="h">このGW ステーク合計</div><div class="v">{total_stake:,}</div></div>
-          <div class="kpi"><div class="h">この時点の想定ペイアウト</div><div class="v">{total_curr:,.2f}</div></div>
+          <div class="kpi"><div class="h">想定ペイアウト</div><div class="v">{total_curr:,.2f}</div></div>
           <div class="kpi"><div class="h">この時点の想定収支</div><div class="v">{total_net:,.2f}</div></div>
         </div>
         """,
