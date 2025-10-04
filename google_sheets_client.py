@@ -1,121 +1,115 @@
-# /google_sheets_client.py
-from __future__ import annotations
-from typing import Dict, List
-from datetime import datetime, timezone, timedelta
+import json
+import time
+from typing import List, Dict, Any, Optional
 
+import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
-import streamlit as st
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-JST = timezone(timedelta(hours=9))
 
-def _col_label(n: int) -> str:
-    s = ""
-    while n > 0:
-        n, r = divmod(n-1, 26)
-        s = chr(65 + r) + s
-    return s
-
+# ---- low level --------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def _client():
-    info = st.secrets["gcp_service_account"]  # secrets.toml に service account を設定
+    info = dict(st.secrets["gcp_service_account"])
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-    gc = gspread.Client(auth=creds)
-    gc.session = gspread.auth.AuthorizedSession(creds)
-    return gc
+    return gspread.authorize(creds)
 
 @st.cache_resource(show_spinner=False)
 def _spreadsheet():
-    ssid = st.secrets["sheets"]["sheet_id"]   # スプレッドシートID
     gc = _client()
+    ssid = st.secrets["sheets"]["sheet_id"]
     return gc.open_by_key(ssid)
 
-def ws(name: str):
-    return _spreadsheet().worksheet(name)
+def ws(sheet_name: str):
+    return _spreadsheet().worksheet(sheet_name)
 
-@st.cache_data(ttl=60, show_spinner=False)
-def read_rows_by_sheet(sheet_name: str) -> List[Dict]:
+# ---- utilities --------------------------------------------------------------
+def _records(sh) -> List[Dict[str, Any]]:
+    """worksheet → list of records (first row is header). 空シートは [] を返す"""
+    vals = sh.get_all_values()
+    if not vals:
+        return []
+    header = vals[0]
+    recs = []
+    for row in vals[1:]:
+        item = {header[i]: (row[i] if i < len(row) else "") for i in range(len(header))}
+        if any(v != "" for v in item.values()):
+            recs.append(item)
+    return recs
+
+def read_rows_by_sheet(sheet_name: str) -> List[Dict[str, Any]]:
+    return _records(ws(sheet_name))
+
+def read_config() -> Dict[str, str]:
+    cfg_rows = read_rows_by_sheet("config")
+    cfg = {r.get("key", ""): r.get("value", "") for r in cfg_rows if r.get("key")}
+    return cfg
+
+def parse_users_from_config(cfg: Dict[str, str]) -> List[Dict[str, Any]]:
+    raw = cfg.get("users_json", "").strip()
+    if not raw:
+        return []
     try:
-        return ws(sheet_name).get_all_records()
+        users = json.loads(raw)
+        # normalize fields / minimal validation
+        norm = []
+        for u in users:
+            norm.append({
+                "username": str(u.get("username", "")).strip(),
+                "password": str(u.get("password", "")).strip(),
+                "role": (u.get("role") or "user").strip(),
+                "team": (u.get("team") or "").strip(),
+            })
+        # remove empty usernames / duplicates by last one wins
+        uniq = {}
+        for u in norm:
+            if u["username"]:
+                uniq[u["username"]] = u
+        return list(uniq.values())
     except Exception:
         return []
 
-@st.cache_data(ttl=60, show_spinner=False)
-def read_config() -> Dict[str, str]:
-    rows = read_rows_by_sheet("config")
-    conf: Dict[str, str] = {}
-    for r in rows:
-        k = str(r.get("key", "")).strip()
-        v = str(r.get("value", "")).strip()
-        if k:
-            conf[k] = v
-    # football_api で利用するため保持
-    st.session_state["_conf_cache"] = conf
-    return conf
-
-def _find_row_idx_by_keys(sheet, keys: Dict[str, str|int]) -> int | None:
-    rows = sheet.get_all_records()
-    for i, r in enumerate(rows, start=2):  # 2=データ先頭（1行目はヘッダ）
-        if all(str(r.get(k)) == str(v) for k, v in keys.items()):
-            return i
-    return None
-
-# ---- bets ----
-def upsert_bet_row(gw: int, match_id: int, username: str, match: str, pick: str, stake: int, odds: float):
-    sheet = ws("bets")
-    keys = {"gw": gw, "match_id": match_id, "user": username}
-    row_idx = _find_row_idx_by_keys(sheet, keys)
-    now = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
-    values = {
-        "gw": gw,
-        "match_id": match_id,
-        "user": username,
-        "match": match,
-        "pick": pick,
-        "stake": stake,
-        "odds": odds,
-        "status": "",
-        "payout": "",
-        "net": "",
-        "ts": now
-    }
-    headers = sheet.row_values(1)
-    ordered = [values.get(h, "") for h in headers]
-    last_col = _col_label(len(headers))
-    if row_idx:
-        sheet.update(f"A{row_idx}:{last_col}{row_idx}", [ordered])
+def upsert_row(sheet_name: str, key_col: str, key_value: str, payload: Dict[str, Any]) -> None:
+    """key_col の値で行を探し、あれば更新、無ければ末尾に追加"""
+    sh = ws(sheet_name)
+    rows = sh.get_all_records()
+    headers = sh.row_values(1)
+    if key_col not in headers:
+        # 1 行目にヘッダがない場合は作る
+        if not headers:
+            headers = list(payload.keys())
+            sh.append_row(headers)
+        else:
+            headers.append(key_col)
+            for k in payload.keys():
+                if k not in headers:
+                    headers.append(k)
+            sh.update("1:1", [headers])
+    # map index
+    key_idx = headers.index(key_col) + 1
+    found_row = None
+    for i, row in enumerate(rows, start=2):
+        if str(row.get(key_col, "")) == str(key_value):
+            found_row = i
+            break
+    # align values by header order
+    row_values = []
+    for h in headers:
+        row_values.append(payload.get(h, "" if h != key_col else key_value))
+    if found_row:
+        sh.update(f"{found_row}:{found_row}", [row_values])
     else:
-        sheet.append_row(ordered, value_input_option="USER_ENTERED")
+        sh.append_row(row_values, value_input_option="USER_ENTERED")
 
-def list_bets_by_gw_and_user(gw: int, username: str) -> List[Dict]:
-    rows = read_rows_by_sheet("bets")
-    return [r for r in rows if str(r.get("gw")) == str(gw) and r.get("user") == username]
+def read_bets() -> List[Dict[str, Any]]:
+    try:
+        return read_rows_by_sheet("bets")
+    except Exception:
+        return []
 
-def list_bets_by_gw(gw: int) -> List[Dict]:
-    rows = read_rows_by_sheet("bets")
-    return [r for r in rows if str(r.get("gw")) == str(gw)]
-
-# ---- odds ----
-def upsert_odds_row(gw: int, match_id: int, home_team: str, away_team: str, home_win: float, draw: float, away_win: float):
-    sheet = ws("odds")
-    keys = {"gw": gw, "match_id": match_id}
-    row_idx = _find_row_idx_by_keys(sheet, keys)
-    now = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
-    values = {
-        "gw": gw,
-        "match_id": match_id,
-        "home_team": home_team,
-        "away_team": away_team,
-        "home_win": home_win,
-        "draw": draw,
-        "away_win": away_win,
-        "updated_at": now
-    }
-    headers = sheet.row_values(1)
-    ordered = [values.get(h, "") for h in headers]
-    last_col = _col_label(len(headers))
-    if row_idx:
-        sheet.update(f"A{row_idx}:{last_col}{row_idx}", [ordered])
-    else:
-        sheet.append_row(ordered, value_input_option="USER_ENTERED")
+def read_odds() -> List[Dict[str, Any]]:
+    try:
+        return read_rows_by_sheet("odds")
+    except Exception:
+        return []
