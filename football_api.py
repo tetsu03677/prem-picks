@@ -1,71 +1,72 @@
+from typing import List, Dict, Any, Tuple
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, List, Tuple, Optional
-
 import pytz
 import requests
 import streamlit as st
 
 FD_BASE = "https://api.football-data.org/v4"
 
-def _tz(conf: Dict[str, str]):
-    name = conf.get("timezone") or "UTC"
-    try:
-        return pytz.timezone(name)
-    except Exception:
-        return pytz.UTC
+def _tz(conf) -> pytz.BaseTzInfo:
+    return pytz.timezone(conf.get("timezone","Asia/Tokyo"))
 
-def _headers(conf: Dict[str, str]):
-    token = conf.get("FOOTBALL_DATA_API_TOKEN", "")
-    return {"X-Auth-Token": token}
+def _headers(conf) -> Dict[str,str]:
+    return {"X-Auth-Token": conf["FOOTBALL_DATA_API_TOKEN"]}
 
-def fetch_matches_window(days: int, conf: Dict[str, str]) -> List[Dict[str, Any]]:
-    """次のN日分の試合（競技会＝PL）を取得"""
-    comp = conf.get("FOOTBALL_DATA_COMPETITION", "PL")
-    season = conf.get("API_FOOTBALL_SEASON", "")
-    # 期間はUTCで投げる
-    now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
-    date_from = now_utc.date().isoformat()
-    date_to = (now_utc + timedelta(days=days)).date().isoformat()
-    params = {"dateFrom": date_from, "dateTo": date_to}
-    if season:
-        params["season"] = season
-    url = f"{FD_BASE}/competitions/{comp}/matches"
-    r = requests.get(url, headers=_headers(conf), params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    return data.get("matches", [])
+def _gw_from_date(dt_utc: datetime, conf) -> str:
+    # ここは football-data の GW 名が API上にないため、簡易に "GW{weeknum}" を採用
+    # 実運用では config[current_gw] を優先表示
+    return conf.get("current_gw","GW?")
 
-def simplify_matches(raw: List[Dict[str, Any]], conf: Dict[str, str]) -> List[Dict[str, Any]]:
+def fetch_matches_window(days: int, competition: str, conf) -> Tuple[List[Dict[str,Any]], str]:
+    """今日から days 日先までの試合を取得し、(試合配列, 表示対象GW) を返す"""
     tz = _tz(conf)
+    now_local = datetime.now(tz)
+    date_from = now_local.date().isoformat()
+    date_to = (now_local + timedelta(days=days)).date().isoformat()
+    url = f"{FD_BASE}/competitions/{competition}/matches"
+    params = {
+        "dateFrom": date_from,
+        "dateTo": date_to,
+        "season": conf.get("API_FOOTBALL_SEASON","2025")
+    }
+    r = requests.get(url, headers=_headers(conf), params=params, timeout=30)
+    r.raise_for_status()
+    js = r.json()
+    matches_raw = js.get("matches", [])
+
     out = []
-    for m in raw:
-        utc_iso = m.get("utcDate")
+    for m in matches_raw:
+        mid = str(m.get("id"))
+        utc_str = m.get("utcDate")
         try:
-            utc_dt = datetime.fromisoformat(utc_iso.replace("Z", "+00:00"))
+            utc_dt = datetime.fromisoformat(utc_str.replace("Z","+00:00"))
         except Exception:
             continue
         local_dt = utc_dt.astimezone(tz)
+        status = m.get("status","SCHEDULED")
+        home = m.get("homeTeam",{}).get("name","")
+        away = m.get("awayTeam",{}).get("name","")
+        score = m.get("score",{})
+        full = score.get("fullTime",{})
+        h_ft = full.get("home")
+        a_ft = full.get("away")
+        live = score.get("halfTime",{})  # 代用（FD はライブ値は status/state 依存）
         out.append({
-            "id": str(m.get("id")),
-            "gw": f"GW{conf.get('current_gw', '').replace('GW','') or ''}",
-            "utc_kickoff": utc_dt,
+            "id": mid,
+            "gw": _gw_from_date(utc_dt, conf),
+            "utc_kickoff": utc_dt.replace(tzinfo=timezone.utc),
             "local_kickoff": local_dt,
-            "home": m.get("homeTeam", {}).get("name", ""),
-            "away": m.get("awayTeam", {}).get("name", ""),
-            "status": m.get("status", ""),
-            "score": m.get("score", {})  # raw score (for future RT)
+            "home": home,
+            "away": away,
+            "status": status,
+            "score_home": h_ft,
+            "score_away": a_ft,
         })
-    # kickoff 昇順
-    out.sort(key=lambda x: x["utc_kickoff"])
-    return out
+    # 表示対象 GW は config[current_gw] を優先
+    gw_display = conf.get("current_gw") or (out[0]["gw"] if out else "GW?")
+    return out, gw_display
 
-def gw_lock_times(matches: List[Dict[str, Any]], conf: Dict[str, str]) -> Tuple[Optional[datetime], Optional[datetime]]:
-    """GWのロック開始/終了（UTC）を返す。最初の試合の2時間前〜最後の試合終了想定時刻(＋2h)"""
-    if not matches:
-        return None, None
-    earliest = min(m["utc_kickoff"] for m in matches)
-    latest = max(m["utc_kickoff"] for m in matches)
-    lock_start = earliest - timedelta(minutes=int(conf.get("lock_minutes_before_earliest", "120") or "120"))
-    # 終了は安全に+2時間
-    lock_end = latest + timedelta(hours=2)
-    return lock_start, lock_end
+def fetch_live_snapshot(competition: str, conf) -> List[Dict[str,Any]]:
+    """リアルタイムページの更新用：直近7日の試合を取得"""
+    matches, _ = fetch_matches_window(7, competition, conf)
+    return matches
