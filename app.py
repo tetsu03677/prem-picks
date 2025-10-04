@@ -21,7 +21,8 @@ from football_api import (
 # ------------------------------------------------------------
 CSS = """
 <style>
-.block-container {padding-top:1.5rem; padding-bottom:3rem;}
+/* ① 上が切れる対策: 余白を少し広げる（他は触らない） */
+.block-container {padding-top:3.2rem; padding-bottom:3rem;}
 .app-card{border:1px solid rgba(120,120,120,.25); border-radius:10px; padding:18px; background:rgba(255,255,255,.02);}
 .subtle{color:rgba(255,255,255,.6); font-size:.9rem}
 .kpi-row{display:flex; gap:12px; flex-wrap:wrap}
@@ -105,13 +106,11 @@ def get_users(conf: Dict[str, str]) -> List[Dict]:
         return [{"username": "guest", "password": "guest", "role": "user", "team": ""}]
 
 # ------------------------------------------------------------
-# 認証
+# 認証（ログイン後はUI非表示）
 # ------------------------------------------------------------
 def login_ui(conf: Dict[str, str]) -> Dict:
     signed = st.session_state.get("signed_in") is True
     me = st.session_state.get("me")
-
-    # ログイン後はコンポーネント自体を隠す（UIは残さない）
     if signed and me:
         return me
 
@@ -157,47 +156,44 @@ def gw_and_lock_state(conf: Dict[str, str], matches: List[Dict]) -> Tuple[str, b
     return gw_name, locked, lock_at_utc
 
 # ------------------------------------------------------------
-# ブックメーカーローテーション（追加①）
+# ブックメーカーローテーション
 # ------------------------------------------------------------
-def compute_bookmaker_rotation(conf: Dict[str, str]) -> Tuple[str, Dict[str, int]]:
+def compute_bookmaker_rotation(conf: Dict[str, str]) -> Tuple[str, Dict[str, int], List[str], bool]:
     """
-    - users_json の並び順でラウンドロビン
-    - 決定タイミング：そのGWの初回キックオフ「後」
-    - 返り値：
-        current_bm  … 今節のBM（未決定なら "-"）
-        counts      … これまでにBMを担当した回数（未決定の今節は含めない）
+    返り値:
+      current_bm: 今節のBM（開始前は "-"）
+      counts    : これまでの担当回数（今節開始前は全員0 / 開始後は今節BMだけ1）
+      players   : ② BM以外（2人）。未開始時は全員。
+      started   : 今節の初回キックオフ済みか
     """
     users = [u["username"] for u in get_users(conf)]
     n = len(users) if users else 0
     if n == 0:
-        return "-", {}
+        return "-", {}, [], False
 
-    # 今週の試合（7日ウィンドウ）を取得して、今節GWと初回KOを確認
     matches_raw, gw_str = fetch_matches_next_gw(conf, day_window=7)
     gw_num = _gw_number(gw_str or conf.get("current_gw", "GW1"))
 
-    # 今節の初回KOが過ぎたか？
     started = False
     if matches_raw:
         earliest_utc = min(m["utc_kickoff"] for m in matches_raw if m.get("utc_kickoff"))
         started = now_utc() >= earliest_utc
 
-    # 今節のBM（開始前は "-"})
+    # 今節BM: ラウンドロビン（順番は users_json の並び）
     current_bm = users[(gw_num - 1) % n] if started else "-"
 
-    # これまでに確定したGW数 m（今節が未開始なら gw_num-1 / 開始後なら gw_num）
-    m = max(0, gw_num - (0 if started else 1))
+    # ③ カウンター: 今節開始前は 0 / 開始後は 今節BM=1, 他=0
+    counts = {u: 0 for u in users}
+    if started and current_bm != "-":
+        counts[current_bm] = 1
 
-    base = m // n
-    r = m % n
-    counts = {}
-    for i, u in enumerate(users):
-        counts[u] = base + (1 if i < r else 0)
+    # ② プレイヤー = BM以外（2人）。未開始時は全員を表示
+    players = [u for u in users if u != current_bm] if current_bm != "-" else users
 
-    return current_bm, counts
+    return current_bm, counts, players, started
 
 # ------------------------------------------------------------
-# UI: トップ（①②をここに追加）
+# UI: トップ（BM & プレイヤー表示、収支ランキング）
 # ------------------------------------------------------------
 def page_home(conf: Dict[str, str], me: Dict):
     st.markdown("## トップ")
@@ -205,33 +201,32 @@ def page_home(conf: Dict[str, str], me: Dict):
     if me:
         st.caption(f"ログイン中： {me['username']} ({me.get('role','')})")
 
-    # --- 追加：次節メンバー紹介（自動BM & プレイヤー一覧） ---
+    # 次節メンバー
     with st.container():
         st.markdown('<div class="app-card">', unsafe_allow_html=True)
         st.markdown('<div class="card-title">次節のメンバー</div>', unsafe_allow_html=True)
 
-        current_bm, bm_counts = compute_bookmaker_rotation(conf)
-        users = [u["username"] for u in get_users(conf)]
+        current_bm, bm_counts, players, started = compute_bookmaker_rotation(conf)
 
         # ブックメーカー
         st.markdown("**ブックメーカー**")
         st.markdown(f'<div class="badge-row"><span class="badge">{current_bm}</span></div>', unsafe_allow_html=True)
 
-        # プレイヤー一覧
+        # ② プレイヤー（BM以外の2人。未開始時は全員）
         st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
         st.markdown("**プレイヤー**")
-        chips = "".join([f'<span class="badge">{u}</span>' for u in users])
+        chips = "".join([f'<span class="badge">{u}</span>' for u in players])
         st.markdown(f'<div class="badge-row">{chips}</div>', unsafe_allow_html=True)
 
-        # 追加②：ユーザー別BMカウンター
+        # ② カウンター（安全策表示）
         st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
         st.markdown("**ブックメーカー担当回数（これまで）**")
-        chips2 = "".join([f'<span class="badge">{u}: {bm_counts.get(u,0)}</span>' for u in users])
+        chips2 = "".join([f'<span class="badge">{u}: {bm_counts.get(u,0)}</span>' for u in sorted(bm_counts.keys())])
         st.markdown(f'<div class="badge-row">{chips2}</div>', unsafe_allow_html=True)
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # --- ユーザー別 収支ランキング（確定ベットのみ集計＝従来どおり） ---
+    # 収支ランキング（確定のみ）
     st.markdown('<div class="section">ユーザー別 収支ランキング（確定ベットのみ集計）</div>', unsafe_allow_html=True)
     bets = read_rows_by_sheet("bets")
     finish = [b for b in bets if (b.get("result") or "").upper() in ("WIN","LOSE")]
