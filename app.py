@@ -1,7 +1,7 @@
 # /app.py
 import json
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import streamlit as st
 
@@ -16,30 +16,42 @@ from google_sheets_client import (
 )
 from football_api import fetch_matches_window, simplify_matches, get_match_result_symbol
 
-# ───────────────────────────────
 # ページ設定（最初に一度だけ）
-# ───────────────────────────────
 st.set_page_config(page_title="Premier Picks", page_icon="⚽", layout="wide")
+
+JST = timezone(timedelta(hours=9))
 
 # ───────────────────────────────
 # 共通ユーティリティ
 # ───────────────────────────────
-JST = timezone(timedelta(hours=9))
-
 def jst(dt_utc_iso: str) -> datetime:
     """UTC ISO文字列→JSTのdatetime"""
     return datetime.fromisoformat(dt_utc_iso.replace("Z", "+00:00")).astimezone(JST)
 
-def fmt_dt(dt: datetime | None) -> str:
-    if not dt:
-        return "-"
-    return dt.strftime("%Y-%m-%d %H:%M")
+def fmt_dt(dt: Optional[datetime]) -> str:
+    return "-" if not dt else dt.strftime("%Y-%m-%d %H:%M")
+
+def _parse_users_json(raw: str) -> List[Dict]:
+    """config.users_json をパース（厳格・エラー表示つき）"""
+    if not raw or raw.strip() == "":
+        st.warning("config の users_json が空です。", icon="⚠️")
+        return []
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            raise ValueError("users_json は配列である必要があります。")
+        ok = []
+        for u in data:
+            if not all(k in u for k in ("username", "password", "role")):
+                raise ValueError("各ユーザーに username / password / role が必要です。")
+            ok.append(u)
+        return ok
+    except Exception as e:
+        st.error(f"users_json の読み込みに失敗しました: {e}", icon="❌")
+        return []
 
 def read_users(conf: Dict[str, str]) -> List[Dict]:
-    try:
-        return json.loads(conf.get("users_json", "[]"))
-    except Exception:
-        return []
+    return _parse_users_json(conf.get("users_json", ""))
 
 def current_user_dict(conf: Dict[str, str], username: str) -> Dict:
     for u in read_users(conf):
@@ -47,29 +59,30 @@ def current_user_dict(conf: Dict[str, str], username: str) -> Dict:
             return u
     return {}
 
-def earliest_ko_in_gw(matches: List[Dict]) -> datetime | None:
+def earliest_ko_in_gw(matches: List[Dict]) -> Optional[datetime]:
     kos = [jst(m["utcDate"]) for m in matches if m.get("utcDate")]
     return min(kos) if kos else None
 
-def calc_lock_time(earliest_ko: datetime | None, lock_minutes: int) -> datetime | None:
+def calc_lock_time(earliest_ko: Optional[datetime], lock_minutes: int) -> Optional[datetime]:
     if earliest_ko is None:
         return None
     return earliest_ko - timedelta(minutes=lock_minutes)
 
+@st.cache_data(ttl=60, show_spinner=False)
 def get_conf() -> Dict[str, str]:
     conf = read_config()
-    # football_api 側でも参照できるよう、セッションにも置く
+    # football_api 側でも参照できるようセッションにも置く
     st.session_state["_conf_cache"] = conf
     return conf
 
 # ───────────────────────────────
-# ログイン（合意の“カード風・中央寄せ UI”、ユーザーは config の JSON からプルダウン）
+# ログイン（カード風 UI / ユーザーは config の users_json からプルダウン）
 # ───────────────────────────────
 def ensure_auth(conf: Dict[str, str]) -> Dict:
     if st.session_state.get("is_authenticated"):
         return st.session_state.get("me", {})
 
-    st.markdown("<div style='display:flex;justify-content:center;'>", unsafe_allow_html=True)
+    st.markdown("<div style='display:flex;justify-content:center;margin-top:4vh;'>", unsafe_allow_html=True)
     with st.container():
         st.markdown(
             "<div style='max-width:420px;width:100%;background:#111418;padding:24px 24px 16px;border-radius:12px;border:1px solid #2a2f36;'>"
@@ -79,6 +92,9 @@ def ensure_auth(conf: Dict[str, str]) -> Dict:
         )
         users = read_users(conf)
         user_names = [u["username"] for u in users] if users else ["guest"]
+        if not users:
+            st.caption("※ users_json が空または不正のため、一時的に guest のみ表示しています。")
+
         username = st.selectbox("ユーザー", options=user_names, index=0, label_visibility="visible")
         password = st.text_input("パスワード", type="password")
         st.write("")  # spacing
@@ -88,6 +104,7 @@ def ensure_auth(conf: Dict[str, str]) -> Dict:
 
     if login_ok:
         user = current_user_dict(conf, username)
+        # users_json が空のときの暫定 guest ログイン許可（任意）
         if user and password == user.get("password"):
             st.session_state.clear()
             st.session_state["is_authenticated"] = True
@@ -110,7 +127,7 @@ def sidebar_logout():
 # ───────────────────────────────
 # GW 取得（直近7日で“次のGW”）＋ ロック判定
 # ───────────────────────────────
-def load_next_gw_matches(conf: Dict[str, str]) -> Tuple[int | None, List[Dict], datetime | None, bool]:
+def load_next_gw_matches(conf: Dict[str, str]) -> Tuple[Optional[int], List[Dict], Optional[datetime], bool]:
     """
     直近7日以内に開始する“次のGW”の試合を football-data から取得し、
     (gw, gw_matches, earliest_ko, locked) を返す
@@ -123,7 +140,6 @@ def load_next_gw_matches(conf: Dict[str, str]) -> Tuple[int | None, List[Dict], 
         data, _ = fetch_matches_window(days, competition=comp, season=season)
         matches = simplify_matches(data)
 
-        # 次のGW（matchday の最小）
         gws = sorted({m["matchday"] for m in matches if m.get("matchday") is not None})
         if not gws:
             return (None, [], None, False)
@@ -138,7 +154,7 @@ def load_next_gw_matches(conf: Dict[str, str]) -> Tuple[int | None, List[Dict], 
     except Exception:
         return (None, [], None, False)
 
-def gw_window_message(active_gw: int | None, earliest_ko: datetime | None, locked: bool, conf: Dict[str, str]):
+def gw_window_message(active_gw: Optional[int], earliest_ko: Optional[datetime], locked: bool, conf: Dict[str, str]):
     if active_gw is None:
         st.info("7日以内に対象のゲームウィークはありません。", icon="ℹ️")
         return
@@ -187,7 +203,6 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
     max_total = int(conf.get("max_total_stake_per_gw", "5000"))
     step = int(conf.get("stake_step", "100"))
     my_total = sum(int(b.get("stake", 0) or 0) for b in my_bets)
-
     st.caption(f"あなたの今GW合計：{my_total} / 上限 {max_total}")
 
     for m in matches:
@@ -222,15 +237,21 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
             default_stake = int(mine.get("stake", 0) or 0) if mine else 0
 
             st.markdown("**ピック**")
-            pick = st.radio(
+            # 表示は HOME WIN / DRAW / AWAY WIN、内部値は HOME/DRAW/AWAY
+            options_lbl = ["HOME WIN", "DRAW", "AWAY WIN"]
+            options_val = ["HOME", "DRAW", "AWAY"]
+            try:
+                default_index = options_val.index(default_pick)
+            except Exception:
+                default_index = 0
+            pick_lbl = st.radio(
                 key=f"pick_{match_id}",
                 label="",
-                options=["HOME WIN","DRAW","AWAY WIN"],
+                options=options_lbl,
                 horizontal=True,
-                index=["HOME","DRAW","AWAY"].index(default_pick) if default_pick in ["HOME","DRAW","AWAY"] else 0
+                index=default_index
             )
-            # 内部値を HOME/DRAW/AWAY に戻す
-            pick_val = {"HOME WIN":"HOME","DRAW":"DRAW","AWAY WIN":"AWAY"}[pick]
+            pick_val = options_val[options_lbl.index(pick_lbl)]
 
             stake = st.number_input(
                 "ベット額",
@@ -283,7 +304,6 @@ def page_dashboard(conf: Dict[str, str], me: Dict):
     bets = read_rows_by_sheet("bets")
     total_stake = sum(int(b.get("stake", 0) or 0) for b in bets)
 
-    # 直近14日で結果参照
     comp = conf.get("FOOTBALL_DATA_COMPETITION", "2021")
     season = conf.get("API_FOOTBALL_SEASON", "2025")
     data, _ = fetch_matches_window(14, competition=comp, season=season)
@@ -368,9 +388,9 @@ def page_realtime(conf: Dict[str, str], me: Dict):
         st.info("試合時間帯以外です。開始後に更新してください。")
         return
 
+    comp = conf.get("FOOTBALL_DATA_COMPETITION", "2021")
+    season = conf.get("API_FOOTBALL_SEASON", "2025")
     with st.spinner("ライブ取得中…"):
-        comp = conf.get("FOOTBALL_DATA_COMPETITION", "2021")
-        season = conf.get("API_FOOTBALL_SEASON", "2025")
         data, _ = fetch_matches_window(14, competition=comp, season=season)
         ms = simplify_matches(data)
         gw_ms = [m for m in ms if m.get("matchday") == active_gw]
@@ -474,7 +494,6 @@ def main():
 
     sidebar_logout()
 
-    # タブ（合意の固定順）
     tabs = st.tabs(["🏠 トップ", "🎯 試合とベット", "📊 ダッシュボード", "📁 履歴", "⏱ リアルタイム", "🛠 オッズ管理"])
     with tabs[0]: page_top(conf, me)
     with tabs[1]: page_matches_and_bets(conf, me)
