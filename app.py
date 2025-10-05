@@ -376,7 +376,7 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
                     st.rerun()
 
 # ------------------------------------------------------------
-# UI: 履歴（収支明示） － 既存維持 → 要件に沿ってこの関数のみ変更
+# UI: 履歴（収支明示） － 既存維持
 # ------------------------------------------------------------
 def page_history(conf: Dict[str, str], me: Dict):
     st.markdown("## 履歴")
@@ -390,31 +390,23 @@ def page_history(conf: Dict[str, str], me: Dict):
     gw_set = sorted(gw_vals, key=_gw_sort_key)
     sel_gw = st.selectbox("表示するGW", gw_set, index=0 if gw_set else None, key="hist_gw")
 
-    # 一覧表示用：GW全員分（従来どおり）
     target = [b for b in bets if (b.get("gw") == sel_gw)]
     if not target:
         st.info("対象のデータがありません。")
         return
 
-    # ---- 追加：KPIはログインユーザー限定で集計 ----
-    my_name = me.get("username")
-    my_target = [b for b in target if b.get("user") == my_name]
-
-    my_total_stake = sum(parse_int(b.get("stake", 0)) for b in my_target)
-    my_total_payout = sum(parse_float(b.get("payout"), 0.0) or 0.0
-                          for b in my_target if (b.get("result") in ["WIN","LOSE"]))
-    my_total_net = my_total_payout - my_total_stake
-
+    total_stake = sum(parse_int(b.get("stake", 0)) for b in target)
+    total_payout = sum(parse_float(b.get("payout"), 0.0) or 0.0 for b in target if (b.get("result") in ["WIN","LOSE"]))
+    total_net = total_payout - total_stake
     kpi_html = f"""
     <div class="kpi-row">
-      <div class="kpi"><div class="h">合計ステーク（{my_name}）</div><div class="v">{my_total_stake:,}</div></div>
-      <div class="kpi"><div class="h">合計ペイアウト（{my_name}）</div><div class="v">{my_total_payout:,.2f}</div></div>
-      <div class="kpi"><div class="h">合計収支（{my_name}）</div><div class="v">{my_total_net:,.2f}</div></div>
+      <div class="kpi"><div class="h">合計ステーク</div><div class="v">{total_stake:,}</div></div>
+      <div class="kpi"><div class="h">合計ペイアウト</div><div class="v">{total_payout:,.2f}</div></div>
+      <div class="kpi"><div class="h">合計収支</div><div class="v">{total_net:,.2f}</div></div>
     </div>
     """
     st.markdown(kpi_html, unsafe_allow_html=True)
 
-    # ---- 一覧は全員分。自分の行だけ強調表示 ----
     def row_view(b):
         stake = parse_int(b.get("stake", 0))
         odds = parse_float(b.get("odds"), 1.0) or 1.0
@@ -425,11 +417,7 @@ def page_history(conf: Dict[str, str], me: Dict):
             tail = f"｜結果：{result} ｜ payout {payout:.2f} ｜ net {net:.2f}"
         else:
             tail = "｜結果：- ｜ payout - ｜ net -"
-
-        is_me = (b.get("user", "") == my_name)
-        prefix = "⭐ **" if is_me else ""
-        suffix = "**" if is_me else ""
-        st.markdown(f"- {prefix}{b.get('user','')}{suffix}：{b.get('match','')} → {b.get('pick','')} / {stake} at {odds} {tail}")
+        st.markdown(f"- **{b.get('user','')}**：{b.get('match','')} → {b.get('pick','')} / {stake} at {odds} {tail}")
 
     for b in target:
         row_view(b)
