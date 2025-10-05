@@ -104,18 +104,14 @@ def get_users(conf: Dict[str, str]) -> List[Dict]:
         return [{"username": "guest", "password": "guest", "role": "user", "team": ""}]
 
 # ------------------------------------------------------------
-# 認証（ログイン後はUIを描画しない） ★ここだけ変更：枠ナシ見出し
+# 認証（ログイン後はUIを描画しない） ★枠ナシ見出し（既存維持）
 # ------------------------------------------------------------
 def login_ui(conf: Dict[str, str]) -> Dict:
-    # すでにログイン済ならフォームは描画しないでそのまま返す
     if st.session_state.get("signed_in") and st.session_state.get("me"):
         return st.session_state.get("me")
 
-    # 未ログイン時のみフォームを表示（枠なし、安全）
     with st.container():
         st.markdown('<div class="login-area">', unsafe_allow_html=True)
-
-        # 見出しをやや大きく。boxやborderは使わない
         st.markdown('<div class="login-title">Premier Picks</div>', unsafe_allow_html=True)
 
         users = get_users(conf)
@@ -143,7 +139,7 @@ def login_ui(conf: Dict[str, str]) -> Dict:
     return st.session_state.get("me")
 
 # ------------------------------------------------------------
-# 共通: GW の判定とロック
+# 共通: GW の判定（参考用）
 # ------------------------------------------------------------
 def gw_and_lock_state(conf: Dict[str, str], matches: List[Dict]) -> Tuple[str, bool, datetime]:
     if not matches:
@@ -159,7 +155,6 @@ def gw_and_lock_state(conf: Dict[str, str], matches: List[Dict]) -> Tuple[str, b
 # トップ専用：BMカウントと次回担当
 # ------------------------------------------------------------
 def _get_bm_counts(users: List[str]) -> Dict[str, int]:
-    """bm_log シートの user カラムを単純集計。シートが無ければ 0。"""
     counts = {u: 0 for u in users}
     try:
         rows = read_rows_by_sheet("bm_log") or []
@@ -172,12 +167,11 @@ def _get_bm_counts(users: List[str]) -> Dict[str, int]:
     return counts
 
 def _pick_next_bm(users: List[str], counts: Dict[str, int]) -> str:
-    """最小回数 → ユーザーリストの順で安定選出（表示のみ。記録はしない）。"""
     order = {u: i for i, u in enumerate(users)}
     return sorted(users, key=lambda u: (counts.get(u, 0), order[u]))[0] if users else ""
 
 # ------------------------------------------------------------
-# UI: トップ（BM表示＋カウンタ）
+# UI: トップ（BM表示＋カウンタ） － 既存維持
 # ------------------------------------------------------------
 def page_home(conf: Dict[str, str], me: Dict):
     st.markdown("## トップ")
@@ -185,14 +179,12 @@ def page_home(conf: Dict[str, str], me: Dict):
     if me:
         st.caption(f"ログイン中： {me['username']} ({me.get('role','')})")
 
-    # 表示用：users とカウンタ
     users_conf = get_users(conf)
     users = [u["username"] for u in users_conf]
     counts = _get_bm_counts(users)
     next_bm = _pick_next_bm(users, counts)
     players = [u for u in users if u != next_bm]
 
-    # 3分割カード（BM=赤、その他=グレー）
     st.markdown('<div class="section">次節のメンバー</div>', unsafe_allow_html=True)
     st.markdown('<div class="role-cards">', unsafe_allow_html=True)
     for u in users:
@@ -208,34 +200,27 @@ def page_home(conf: Dict[str, str], me: Dict):
         st.markdown(html, unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # プレイヤー（安全策でテキスト表示も）
     st.markdown('<div class="section">プレイヤー</div>', unsafe_allow_html=True)
     st.write(", ".join(players) if players else "-")
 
-    # 担当回数
     st.markdown('<div class="section">ブックメーカー担当回数（これまで）</div>', unsafe_allow_html=True)
     badges = " ".join([f'<span class="badge">{u}: {counts.get(u,0)}</span>' for u in users])
     st.markdown(f'<div class="badges">{badges}</div>', unsafe_allow_html=True)
 
 # ------------------------------------------------------------
-# UI: 試合とベット
+# UI: 試合とベット ★①試合ごとの個別ロック、★③フォーム化で入力時rerun防止
 # ------------------------------------------------------------
 def page_matches_and_bets(conf: Dict[str, str], me: Dict):
     st.markdown("## 試合とベット")
 
     matches_raw, gw = fetch_matches_next_gw(conf, day_window=7)
-    gw_name, locked, _ = gw_and_lock_state(conf, matches_raw)
+    gw_name, _, _ = gw_and_lock_state(conf, matches_raw)  # 参照のみ（全体ロックは使わない）
 
     bets_all = read_rows_by_sheet("bets")
     my_gw_bets = [b for b in bets_all if (b.get("user") == me["username"] and (b.get("gw") == gw_name or b.get("gw") == gw_name.replace("GW","")))]
     my_total = sum(parse_int(b.get("stake", 0)) for b in my_gw_bets)
     max_total = parse_int(conf.get("max_total_stake_per_gw", 5000), 5000)
     st.markdown(f'<div class="kpi-row"><div class="kpi"><div class="h">このGWのあなたの投票合計</div><div class="v">{my_total:,} / 上限 {max_total:,}</div></div></div>', unsafe_allow_html=True)
-
-    if locked:
-        st.error("ロック済み（このGWの最初の試合 2 時間前で締切）")
-    else:
-        st.success("現在は投票可能です")
 
     if not matches_raw:
         st.info("7日以内に表示できる試合がありません。")
@@ -245,13 +230,20 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
     odds_by_match = {str(r.get("match_id")): r for r in odds_rows if r.get("match_id")}
 
     step = parse_int(conf.get("stake_step", 100), 100)
+    lock_minutes = parse_int(conf.get("odds_freeze_minutes_before_first", 120), 120)
 
     for m in matches_raw:
         match_id = str(m["id"])
         teams_line = f"{m['home']} vs {m['away']}"
+
+        # ★各試合の個別ロック
+        lock_at = m["utc_kickoff"] - timedelta(minutes=lock_minutes) if m.get("utc_kickoff") else None
+        locked_this = (now_utc() >= lock_at) if lock_at else False
+
         with st.container(border=True):
             st.markdown(f"**{gw_name}**　・　{m['local_kickoff'].strftime('%m/%d %H:%M')}")
             st.markdown(f"### {teams_line}")
+            st.caption("（この試合はキックオフ2時間前に個別ロック）")
 
             od = odds_by_match.get(match_id, {})
             home_odds = parse_float(od.get("home_win"), 1.0)
@@ -269,13 +261,16 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
                 summary[b.get("pick","")] = summary.get(b.get("pick",""),0) + parse_int(b.get("stake",0))
             st.caption(f"現在のベット状況（あなた）: HOME {summary['HOME']} / DRAW {summary['DRAW']} / AWAY {summary['AWAY']}")
 
-            pick_key = f"pick_{match_id}"
-            stake_key = f"stake_{match_id}"
-            pick = st.radio("ピック", ["HOME","DRAW","AWAY"], key=pick_key, horizontal=True, disabled=locked)
-            stake = st.number_input("ステーク", min_value=step, step=step, value=step, key=stake_key, disabled=locked)
+            # ★フォーム化（number_input変更ではrerunしない）
+            with st.form(f"bet_form_{match_id}", clear_on_submit=False):
+                c1, c2 = st.columns([2,1])
+                with c1:
+                    pick = st.radio("ピック", ["HOME","DRAW","AWAY"], key=f"pick_{match_id}", horizontal=True, disabled=locked_this)
+                with c2:
+                    stake = st.number_input("ステーク", min_value=step, step=step, value=step, key=f"stake_{match_id}", disabled=locked_this)
+                submitted = st.form_submit_button("この内容でベット", disabled=locked_this, use_container_width=True)
 
-            btn_key = f"bet_{match_id}"
-            if st.button("この内容でベット", key=btn_key, disabled=locked):
+            if submitted:
                 if my_total + stake > max_total:
                     st.warning("このGWの投票上限を超えます。金額を調整してください。")
                 else:
@@ -298,7 +293,7 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
                     st.rerun()
 
 # ------------------------------------------------------------
-# UI: 履歴（収支明示）
+# UI: 履歴（収支明示） － 既存維持
 # ------------------------------------------------------------
 def page_history(conf: Dict[str, str], me: Dict):
     st.markdown("## 履歴")
@@ -345,7 +340,7 @@ def page_history(conf: Dict[str, str], me: Dict):
         row_view(b)
 
 # ------------------------------------------------------------
-# UI: リアルタイム
+# UI: リアルタイム ★②そのGWの全試合を表示
 # ------------------------------------------------------------
 def page_realtime(conf: Dict[str, str], me: Dict):
     st.markdown("## リアルタイム")
@@ -356,20 +351,42 @@ def page_realtime(conf: Dict[str, str], me: Dict):
         st.info("試合が見つかりません（APIが403の場合は時間をおいて再試行ください）。")
         return
 
-    match_ids = [str(m["id"]) for m in matches_raw]
-    scores = fetch_scores_for_match_ids(conf, match_ids)
+    # すでに取得できた“未開催の試合”
+    api_ids = [str(m["id"]) for m in matches_raw]
+    api_meta = {str(m["id"]): {"home": m["home"], "away": m["away"], "utc_kickoff": m.get("utc_kickoff")} for m in matches_raw}
 
-    bets = read_rows_by_sheet("bets")
+    # 同GWの odds / bets から ID を補完（GW全試合化）
     odds_rows = read_rows_by_sheet("odds")
-    odds_by_match = {str(r.get("match_id")): r for r in odds_rows if r.get("match_id")}
+    bets_rows = read_rows_by_sheet("bets")
 
+    gw_odds = [r for r in odds_rows if str(r.get("gw", "")) == str(gw)]
+    gw_bets = [r for r in bets_rows if str(r.get("gw", "")) == str(gw)]
+
+    odds_ids = [str(r.get("match_id")) for r in gw_odds if r.get("match_id")]
+    bet_ids = [str(r.get("match_id")) for r in gw_bets if r.get("match_id")]
+
+    all_ids = sorted(list({*api_ids, *odds_ids, *bet_ids}))
+
+    # 表示用 home/away の補完（APIになければoddsから）
+    for r in gw_odds:
+        mid = str(r.get("match_id"))
+        if mid and mid not in api_meta:
+            api_meta[mid] = {"home": r.get("home", f"HOME({mid})"), "away": r.get("away", f"AWAY({mid})"), "utc_kickoff": None}
+
+    # スコア取得（GW全試合ぶん）
+    scores = fetch_scores_for_match_ids(conf, all_ids)
+
+    # KPI（既存ロジック維持／ただし対象試合はGW全体）
     def current_payout(b):
         mid = str(b.get("match_id"))
         stake = parse_int(b.get("stake", 0))
         pick = b.get("pick", "")
-        odds = parse_float(b.get("odds"), None) or parse_float(odds_by_match.get(mid, {}).get(
-            {"HOME":"home_win","DRAW":"draw","AWAY":"away_win"}[pick]
-        ), 1.0)
+        # まずはベット時のオッズ、なければoddsシート
+        odds_by_match = {str(r.get("match_id")): r for r in gw_odds if r.get("match_id")}
+        odds = parse_float(b.get("odds"), None) or parse_float(
+            odds_by_match.get(mid, {}).get({"HOME":"home_win","DRAW":"draw","AWAY":"away_win"}[pick]),
+            1.0
+        )
 
         sc = scores.get(mid)
         if not sc:
@@ -388,7 +405,7 @@ def page_realtime(conf: Dict[str, str], me: Dict):
         winner_now = "HOME" if hs > as_ else "AWAY"
         return stake * odds if pick == winner_now else 0.0
 
-    this_gw_bets = [b for b in bets if (b.get("gw") == gw)]
+    this_gw_bets = [b for b in bets_rows if (b.get("gw") == gw)]
     total_stake = sum(parse_int(b.get("stake", 0)) for b in this_gw_bets)
     total_curr = sum(current_payout(b) for b in this_gw_bets)
     total_net = total_curr - total_stake
@@ -404,6 +421,7 @@ def page_realtime(conf: Dict[str, str], me: Dict):
         unsafe_allow_html=True,
     )
 
+    # ユーザー別の時点収支
     users = sorted(list({b.get("user") for b in this_gw_bets if b.get("user")}))
     if users:
         st.markdown('<div class="section">ユーザー別の時点収支</div>', unsafe_allow_html=True)
@@ -416,12 +434,19 @@ def page_realtime(conf: Dict[str, str], me: Dict):
             with cols[i % len(cols)]:
                 st.markdown(f'<div class="kpi"><div class="h">{u}</div><div class="v">{unat:,.2f}</div><div class="h">stake {ustake:,} / payout {upayout:,.2f}</div></div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="section">試合別（現在スコアに基づく暫定）</div>', unsafe_allow_html=True)
-    for m in matches_raw:
-        mid = str(m["id"])
+    # 試合別（GW全試合）
+    st.markdown('<div class="section">試合別（現在スコアに基づく暫定：GW全試合）</div>', unsafe_allow_html=True)
+
+    def kickoff_key(mid):
+        info = api_meta.get(mid, {})
+        ko = info.get("utc_kickoff")
+        return (0, ko) if ko else (1, None)
+
+    for mid in sorted(all_ids, key=kickoff_key):
+        info = api_meta.get(mid, {"home": f"HOME({mid})", "away": f"AWAY({mid})"})
         s = scores.get(mid, {})
         hs, as_ = s.get("home_score", 0), s.get("away_score", 0)
-        st.markdown(f"**{m['home']} vs {m['away']}**　（{s.get('status','-')}　{hs}-{as_}）")
+        st.markdown(f"**{info['home']} vs {info['away']}**　（{s.get('status','-')}　{hs}-{as_}）")
         rows = [b for b in this_gw_bets if str(b.get("match_id")) == mid]
         if not rows:
             st.caption("（ベットなし）")
@@ -434,7 +459,7 @@ def page_realtime(conf: Dict[str, str], me: Dict):
         st.rerun()
 
 # ------------------------------------------------------------
-# UI: ダッシュボード
+# UI: ダッシュボード － 既存維持
 # ------------------------------------------------------------
 def page_dashboard(conf: Dict[str, str], me: Dict):
     st.markdown("## ダッシュボード")
@@ -498,7 +523,7 @@ def page_dashboard(conf: Dict[str, str], me: Dict):
             st.caption(f"　- {t}: 的中率 {acc*100:.1f}%（{n}件）／ 累計net {net:,.2f}")
 
 # ------------------------------------------------------------
-# UI: オッズ管理（入力は横並び・フォーム化・刻み0.1）
+# UI: オッズ管理（入力は横並び・フォーム化・刻み0.1） － 既存維持
 # ------------------------------------------------------------
 def page_odds_admin(conf: Dict[str, str], me: Dict):
     st.markdown("## オッズ管理")
