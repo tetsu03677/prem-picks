@@ -1,4 +1,3 @@
-# app.py
 import json
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple
@@ -208,7 +207,7 @@ def page_home(conf: Dict[str, str], me: Dict):
     st.markdown(f'<div class="badges">{badges}</div>', unsafe_allow_html=True)
 
 # ------------------------------------------------------------
-# UI: 試合とベット ★①試合ごとの個別ロック、★③フォーム化で入力時rerun防止
+# UI: 試合とベット ★①試合ごとの個別ロック＋既存ベットを初期値に反映、★③フォーム化で入力時rerun防止
 # ------------------------------------------------------------
 def page_matches_and_bets(conf: Dict[str, str], me: Dict):
     st.markdown("## 試合とベット")
@@ -217,6 +216,7 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
     gw_name, _, _ = gw_and_lock_state(conf, matches_raw)  # 参照のみ（全体ロックは使わない）
 
     bets_all = read_rows_by_sheet("bets")
+    # 自分のこのGWのベット一覧
     my_gw_bets = [b for b in bets_all if (b.get("user") == me["username"] and (b.get("gw") == gw_name or b.get("gw") == gw_name.replace("GW","")))]
     my_total = sum(parse_int(b.get("stake", 0)) for b in my_gw_bets)
     max_total = parse_int(conf.get("max_total_stake_per_gw", 5000), 5000)
@@ -231,6 +231,29 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
 
     step = parse_int(conf.get("stake_step", 100), 100)
     lock_minutes = parse_int(conf.get("odds_freeze_minutes_before_first", 120), 120)
+
+    # ★自分×GW×試合IDで「最新」ベットを引くヘルパ
+    def latest_my_bet_for_match(match_id: str):
+        rows = [b for b in my_gw_bets if str(b.get("match_id")) == match_id]
+        if not rows:
+            return None
+        # placed_at or key の末尾ISOを頼りに並べ替え
+        def _row_ts(b):
+            ts = b.get("placed_at") or ""
+            try:
+                return datetime.fromisoformat(ts)
+            except Exception:
+                # key 末尾のISOを推測
+                k = str(b.get("key",""))
+                if ":" in k:
+                    tail = k.split(":")[-1]
+                    try:
+                        return datetime.fromisoformat(tail)
+                    except Exception:
+                        return datetime.min.replace(tzinfo=None)
+                return datetime.min.replace(tzinfo=None)
+        rows.sort(key=_row_ts, reverse=True)
+        return rows[0]
 
     for m in matches_raw:
         match_id = str(m["id"])
@@ -255,28 +278,53 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
                 st.info("オッズ未入力のため仮オッズ (=1.0) を表示中。管理者は『オッズ管理』で設定してください。")
                 st.caption(f"Home: {home_odds:.2f} / Draw: {draw_odds:.2f} / Away: {away_odds:.2f}")
 
+            # あなたのこの試合の既存ベット（最新）を初期値にする
+            last = latest_my_bet_for_match(match_id)
+            default_pick = (last.get("pick") if last else "HOME")
+            default_stake = parse_int(last.get("stake"), 0) if last else 0
+
+            # 参考：この試合に対する自分のサマリ（既存表示はそのまま）
             mine = [b for b in my_gw_bets if str(b.get("match_id")) == match_id]
             summary = {"HOME":0,"DRAW":0,"AWAY":0}
             for b in mine:
                 summary[b.get("pick","")] = summary.get(b.get("pick",""),0) + parse_int(b.get("stake",0))
             st.caption(f"現在のベット状況（あなた）: HOME {summary['HOME']} / DRAW {summary['DRAW']} / AWAY {summary['AWAY']}")
 
-            # ★フォーム化（number_input変更ではrerunしない）
+            # ★フォーム化（number_input変更ではrerunしない）＋ 未ベットは stake=0 表示
             with st.form(f"bet_form_{match_id}", clear_on_submit=False):
                 c1, c2 = st.columns([2,1])
                 with c1:
-                    pick = st.radio("ピック", ["HOME","DRAW","AWAY"], key=f"pick_{match_id}", horizontal=True, disabled=locked_this)
+                    pick = st.radio(
+                        "ピック",
+                        ["HOME","DRAW","AWAY"],
+                        index=["HOME","DRAW","AWAY"].index(default_pick) if default_pick in ["HOME","DRAW","AWAY"] else 0,
+                        key=f"pick_{match_id}",
+                        horizontal=True,
+                        disabled=locked_this
+                    )
                 with c2:
-                    stake = st.number_input("ステーク", min_value=step, step=step, value=step, key=f"stake_{match_id}", disabled=locked_this)
+                    stake = st.number_input(
+                        "ステーク",
+                        min_value=0,             # ★未ベットは0、増減も可能
+                        step=step,
+                        value=default_stake,     # ★既存値を初期表示
+                        key=f"stake_{match_id}",
+                        disabled=locked_this
+                    )
                 submitted = st.form_submit_button("この内容でベット", disabled=locked_this, use_container_width=True)
 
             if submitted:
-                if my_total + stake > max_total:
-                    st.warning("このGWの投票上限を超えます。金額を調整してください。")
+                # ★上限チェックは差分で
+                existing = default_stake
+                proposed_total = my_total - existing + int(stake)
+                if proposed_total > max_total:
+                    st.warning(f"このGWの投票上限（{max_total:,}）を超えます。現在 {my_total:,} → 変更後 {proposed_total:,}")
                 else:
                     use_odds = {"HOME": home_odds, "DRAW": draw_odds, "AWAY": away_odds}[pick]
+                    # ★同一試合は1行に上書きされるよう key を固定（タイムスタンプ削除）
+                    fixed_key = f"{gw_name}:{me['username']}:{match_id}"
                     row = {
-                        "key": f"{gw_name}:{me['username']}:{match_id}:{datetime.utcnow().isoformat()}",
+                        "key": fixed_key,
                         "gw": gw_name,
                         "user": me["username"],
                         "match_id": match_id,
@@ -284,19 +332,19 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
                         "pick": pick,
                         "stake": str(int(stake)),
                         "odds": str(use_odds),
-                        "placed_at": datetime.utcnow().date().isoformat(),
+                        "placed_at": datetime.utcnow().isoformat(timespec="seconds"),
                         "status": "OPEN",
                         "result": "", "payout": "", "net": "", "settled_at": "",
                     }
                     upsert_row("bets", row, key_col="key")
-                    st.success("ベットを登録しました。")
+                    st.success("ベットを更新しました。")
                     st.rerun()
 
 # ------------------------------------------------------------
 # UI: 履歴（収支明示） － 既存維持
 # ------------------------------------------------------------
 def page_history(conf: Dict[str, str], me: Dict):
-    st.markdown("## 履歴")
+    st.markdown("## 屴歴")
 
     bets = read_rows_by_sheet("bets")
     if not bets:
@@ -340,7 +388,7 @@ def page_history(conf: Dict[str, str], me: Dict):
         row_view(b)
 
 # ------------------------------------------------------------
-# UI: リアルタイム ★②そのGWの全試合を表示
+# UI: リアルタイム ★②そのGWの全試合を表示（既存ロジック維持）
 # ------------------------------------------------------------
 def page_realtime(conf: Dict[str, str], me: Dict):
     st.markdown("## リアルタイム")
