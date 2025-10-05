@@ -291,11 +291,21 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
             home_odds = parse_float(od.get("home_win"), 1.0)
             draw_odds = parse_float(od.get("draw"), 1.0)
             away_odds = parse_float(od.get("away_win"), 1.0)
+
             if od:
                 st.caption(f"Home: {home_odds:.2f} / Draw: {draw_odds:.2f} / Away: {away_odds:.2f}")
             else:
                 st.info("オッズ未入力のため仮オッズ (=1.0) を表示中。管理者は『オッズ管理』で設定してください。")
                 st.caption(f"Home: {home_odds:.2f} / Draw: {draw_odds:.2f} / Away: {away_odds:.2f}")
+
+            # ===== 追加：オッズ確定チェック（locked=YES かつ 3値>1.0） =====
+            is_odds_ready = (
+                str(od.get("locked", "")).upper() == "YES"
+                and (home_odds is not None and draw_odds is not None and away_odds is not None)
+                and (home_odds > 1.0 and draw_odds > 1.0 and away_odds > 1.0)
+            )
+            if not is_odds_ready:
+                st.warning("オッズ未確定のためベッティング不可。ブックメーカーが確定してください。")
 
             # あなたのこの試合の既存ベット（最新）を初期値にする
             last = latest_my_bet_for_match(match_id)
@@ -312,6 +322,7 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
             # ★フォーム化（number_input変更ではrerunしない）＋ 未ベットは stake=0 表示
             with st.form(f"bet_form_{match_id}", clear_on_submit=False):
                 c1, c2 = st.columns([2,1])
+                disabled_flag = (locked_this or (not is_odds_ready))
                 with c1:
                     pick = st.radio(
                         "ピック",
@@ -319,7 +330,7 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
                         index=["HOME","DRAW","AWAY"].index(default_pick) if default_pick in ["HOME","DRAW","AWAY"] else 0,
                         key=f"pick_{match_id}",
                         horizontal=True,
-                        disabled=locked_this
+                        disabled=disabled_flag
                     )
                 with c2:
                     stake = st.number_input(
@@ -328,11 +339,16 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
                         step=step,
                         value=default_stake,     # ★既存値を初期表示
                         key=f"stake_{match_id}",
-                        disabled=locked_this
+                        disabled=disabled_flag
                     )
-                submitted = st.form_submit_button("この内容でベット", disabled=locked_this, use_container_width=True)
+                submitted = st.form_submit_button("この内容でベット", disabled=disabled_flag, use_container_width=True)
 
             if submitted:
+                # ===== 二重防御：サーバー側でもオッズ未確定なら保存拒否 =====
+                if not is_odds_ready:
+                    st.warning("オッズ未確定のため、この試合にはまだベットできません。")
+                    st.stop()
+
                 # ★上限チェックは差分で
                 existing = default_stake
                 proposed_total = my_total - existing + int(stake)
@@ -638,37 +654,44 @@ def page_odds_admin(conf: Dict[str, str], me: Dict):
 
             # フォームで包み、保存時のみ反映＆rerun
             with st.form(f"odds_form_{mid}", clear_on_submit=False):
-                c1, c2, c3, c4 = st.columns([1,1,1,0.6])
+                c1, c2, c3, c4, c5 = st.columns([1,1,1,0.9,1.2])
                 with c1:
-                    home = st.number_input("Home", min_value=1.0, step=0.1,
-                                           value=parse_float(od.get("home_win"), 1.0),
+                    home = st.number_input("Home", min_value=1.01, step=0.1,
+                                           value=parse_float(od.get("home_win"), 1.01),
                                            key=f"od_h_{mid}", disabled=not is_admin)
                 with c2:
-                    draw = st.number_input("Draw", min_value=1.0, step=0.1,
-                                           value=parse_float(od.get("draw"), 1.0),
+                    draw = st.number_input("Draw", min_value=1.01, step=0.1,
+                                           value=parse_float(od.get("draw"), 1.01),
                                            key=f"od_d_{mid}", disabled=not is_admin)
                 with c3:
-                    away = st.number_input("Away", min_value=1.0, step=0.1,
-                                           value=parse_float(od.get("away_win"), 1.0),
+                    away = st.number_input("Away", min_value=1.01, step=0.1,
+                                           value=parse_float(od.get("away_win"), 1.01),
                                            key=f"od_a_{mid}", disabled=not is_admin)
                 with c4:
+                    confirm = st.checkbox("オッズを確定（公開）", value=(str(od.get("locked","")).upper()=="YES"),
+                                          key=f"od_locked_{mid}", disabled=not is_admin)
+                with c5:
                     submitted = st.form_submit_button("保存", disabled=not is_admin, use_container_width=True)
 
                 if submitted and is_admin:
-                    row = {
-                        "gw": gw,
-                        "match_id": mid,
-                        "home": m["home"],
-                        "away": m["away"],
-                        "home_win": str(home),
-                        "draw": str(draw),
-                        "away_win": str(away),
-                        "locked": "",
-                        "updated_at": datetime.utcnow().isoformat(timespec="seconds"),
-                    }
-                    upsert_row("odds", row, key_cols=["match_id", "gw"])
-                    st.success("保存しました。")
-                    st.rerun()
+                    # 念のためのバリデーション
+                    if home <= 1.0 or draw <= 1.0 or away <= 1.0:
+                        st.warning("3つのオッズはすべて 1.01 以上で入力してください。")
+                    else:
+                        row = {
+                            "gw": gw,
+                            "match_id": mid,
+                            "home": m["home"],
+                            "away": m["away"],
+                            "home_win": str(home),
+                            "draw": str(draw),
+                            "away_win": str(away),
+                            "locked": "YES" if confirm else "",
+                            "updated_at": datetime.utcnow().isoformat(timespec="seconds"),
+                        }
+                        upsert_row("odds", row, key_cols=["match_id", "gw"])
+                        st.success("保存しました。")
+                        st.rerun()
 
 # ------------------------------------------------------------
 # メイン
