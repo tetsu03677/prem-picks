@@ -388,7 +388,7 @@ def page_history(conf: Dict[str, str], me: Dict):
         row_view(b)
 
 # ------------------------------------------------------------
-# UI: リアルタイム ★②そのGWの全試合を表示（既存ロジック維持）
+# UI: リアルタイム ★②そのGWの“未開始＋進行中のみ”表示＆不完全データ除外
 # ------------------------------------------------------------
 def page_realtime(conf: Dict[str, str], me: Dict):
     st.markdown("## リアルタイム")
@@ -397,52 +397,57 @@ def page_realtime(conf: Dict[str, str], me: Dict):
     matches_raw, gw = fetch_matches_next_gw(conf, day_window=7)
     if not matches_raw:
         st.info("試合が見つかりません（APIが403の場合は時間をおいて再試行ください）。")
-        return
-
-    # すでに取得できた“未開催の試合”
+    # APIから得られた“これからの試合”
     api_ids = [str(m["id"]) for m in matches_raw]
     api_meta = {str(m["id"]): {"home": m["home"], "away": m["away"], "utc_kickoff": m.get("utc_kickoff")} for m in matches_raw}
 
-    # 同GWの odds / bets から ID を補完（GW全試合化）
+    # 同GWの odds / bets から ID を補完（home/away が両方あるものだけ）
     odds_rows = read_rows_by_sheet("odds")
     bets_rows = read_rows_by_sheet("bets")
 
     gw_odds = [r for r in odds_rows if str(r.get("gw", "")) == str(gw)]
     gw_bets = [r for r in bets_rows if str(r.get("gw", "")) == str(gw)]
 
-    odds_ids = [str(r.get("match_id")) for r in gw_odds if r.get("match_id")]
+    def has_teams(r):
+        return bool(str(r.get("home","")).strip() and str(r.get("away","")).strip())
+
+    odds_ids = [str(r.get("match_id")) for r in gw_odds if r.get("match_id") and has_teams(r)]
     bet_ids = [str(r.get("match_id")) for r in gw_bets if r.get("match_id")]
 
-    all_ids = sorted(list({*api_ids, *odds_ids, *bet_ids}))
-
-    # 表示用 home/away の補完（APIになければoddsから）
+    # メタ情報補完（oddsにhome/awayがあるものだけ）
     for r in gw_odds:
         mid = str(r.get("match_id"))
-        if mid and mid not in api_meta:
-            api_meta[mid] = {"home": r.get("home", f"HOME({mid})"), "away": r.get("away", f"AWAY({mid})"), "utc_kickoff": None}
+        if mid and mid not in api_meta and has_teams(r):
+            api_meta[mid] = {"home": r.get("home"), "away": r.get("away"), "utc_kickoff": None}
 
-    # スコア取得（GW全試合ぶん）
-    scores = fetch_scores_for_match_ids(conf, all_ids)
+    candidate_ids = sorted(list({*api_ids, *odds_ids, *bet_ids}))
 
-    # KPI（既存ロジック維持／ただし対象試合はGW全体）
+    # スコア取得
+    scores = fetch_scores_for_match_ids(conf, candidate_ids)
+
+    # ★終了済みは除外（未開始・進行中のみ）
+    def is_active(mid):
+        s = scores.get(mid, {})
+        status = (s.get("status") or "").upper()
+        return status not in ("FINISHED", "AWARDED")  # それ以外（SCHEDULED/TIMED/IN_PLAY等）は表示
+
+    active_ids = [mid for mid in candidate_ids if is_active(mid)]
+
+    # KPI（既存ロジック維持：GW全体のベットに対する時点想定。表示はactiveのみ）
     def current_payout(b):
         mid = str(b.get("match_id"))
         stake = parse_int(b.get("stake", 0))
         pick = b.get("pick", "")
-        # まずはベット時のオッズ、なければoddsシート
         odds_by_match = {str(r.get("match_id")): r for r in gw_odds if r.get("match_id")}
         odds = parse_float(b.get("odds"), None) or parse_float(
             odds_by_match.get(mid, {}).get({"HOME":"home_win","DRAW":"draw","AWAY":"away_win"}[pick]),
             1.0
         )
-
         sc = scores.get(mid)
         if not sc:
             return 0.0
-
         status = sc.get("status")
         hs, as_ = sc.get("home_score", 0), sc.get("away_score", 0)
-
         if status in ("SCHEDULED", "TIMED", "POSTPONED"):
             return 0.0
         if status in ("FINISHED", "AWARDED"):
@@ -482,16 +487,19 @@ def page_realtime(conf: Dict[str, str], me: Dict):
             with cols[i % len(cols)]:
                 st.markdown(f'<div class="kpi"><div class="h">{u}</div><div class="v">{unat:,.2f}</div><div class="h">stake {ustake:,} / payout {upayout:,.2f}</div></div>', unsafe_allow_html=True)
 
-    # 試合別（GW全試合）
-    st.markdown('<div class="section">試合別（現在スコアに基づく暫定：GW全試合）</div>', unsafe_allow_html=True)
+    # 試合別（未開始＋進行中のみ）
+    st.markdown('<div class="section">試合別（現在スコアに基づく暫定：未開始＋進行中）</div>', unsafe_allow_html=True)
 
     def kickoff_key(mid):
         info = api_meta.get(mid, {})
         ko = info.get("utc_kickoff")
         return (0, ko) if ko else (1, None)
 
-    for mid in sorted(all_ids, key=kickoff_key):
-        info = api_meta.get(mid, {"home": f"HOME({mid})", "away": f"AWAY({mid})"})
+    for mid in sorted(active_ids, key=kickoff_key):
+        info = api_meta.get(mid)
+        if not info:
+            # メタが無い（home/away欠損など）は表示しない
+            continue
         s = scores.get(mid, {})
         hs, as_ = s.get("home_score", 0), s.get("away_score", 0)
         st.markdown(f"**{info['home']} vs {info['away']}**　（{s.get('status','-')}　{hs}-{as_}）")
