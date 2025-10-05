@@ -274,29 +274,24 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
         rows.sort(key=_row_ts, reverse=True)
         return rows[0]
 
-    for m in matches_raw:
-        match_id = str(m["id"])
-        teams_line = f"{m['home']} vs {m['away']}"
+    # ===== ここから：全試合をひとつのフォームで一括保存 =====
+    picks, stakes = {}, {}
+    defaults, odds_map, meta_home = {}, {}, {}
+    locked_map, ready_map = {}, {}
 
-        # ★各試合の個別ロック
-        lock_at = m["utc_kickoff"] - timedelta(minutes=lock_minutes) if m.get("utc_kickoff") else None
-        locked_this = (now_utc() >= lock_at) if lock_at else False
+    with st.form("bets_bulk_form", clear_on_submit=False):
+        for m in matches_raw:
+            match_id = str(m["id"])
+            teams_line = f"{m['home']} vs {m['away']}"
 
-        with st.container(border=True):
-            st.markdown(f"**{gw_name}**　・　{m['local_kickoff'].strftime('%m/%d %H:%M')}")
-            st.markdown(f"### {teams_line}")
-            st.caption("（この試合はキックオフ2時間前に個別ロック）")
+            # ★各試合の個別ロック
+            lock_at = m["utc_kickoff"] - timedelta(minutes=lock_minutes) if m.get("utc_kickoff") else None
+            locked_this = (now_utc() >= lock_at) if lock_at else False
 
             od = odds_by_match.get(match_id, {})
             home_odds = parse_float(od.get("home_win"), 1.0)
             draw_odds = parse_float(od.get("draw"), 1.0)
             away_odds = parse_float(od.get("away_win"), 1.0)
-
-            if od:
-                st.caption(f"Home: {home_odds:.2f} / Draw: {draw_odds:.2f} / Away: {away_odds:.2f}")
-            else:
-                st.info("オッズ未入力のため仮オッズ (=1.0) を表示中。管理者は『オッズ管理』で設定してください。")
-                st.caption(f"Home: {home_odds:.2f} / Draw: {draw_odds:.2f} / Away: {away_odds:.2f}")
 
             # ===== 追加：オッズ確定チェック（locked=YES かつ 3値>1.0） =====
             is_odds_ready = (
@@ -304,23 +299,35 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
                 and (home_odds is not None and draw_odds is not None and away_odds is not None)
                 and (home_odds > 1.0 and draw_odds > 1.0 and away_odds > 1.0)
             )
-            if not is_odds_ready:
-                st.warning("オッズ未確定のためベッティング不可。ブックメーカーが確定してください。")
 
-            # あなたのこの試合の既存ベット（最新）を初期値にする
+            # 既存ベット（最新）を初期値に
             last = latest_my_bet_for_match(match_id)
             default_pick = (last.get("pick") if last else "HOME")
             default_stake = parse_int(last.get("stake"), 0) if last else 0
 
-            # 参考：この試合に対する自分のサマリ（既存表示はそのまま）
-            mine = [b for b in my_gw_bets if str(b.get("match_id")) == match_id]
-            summary = {"HOME":0,"DRAW":0,"AWAY":0}
-            for b in mine:
-                summary[b.get("pick","")] = summary.get(b.get("pick",""),0) + parse_int(b.get("stake",0))
-            st.caption(f"現在のベット状況（あなた）: HOME {summary['HOME']} / DRAW {summary['DRAW']} / AWAY {summary['AWAY']}")
+            # 表示ブロック
+            with st.container(border=True):
+                st.markdown(f"**{gw_name}**　・　{m['local_kickoff'].strftime('%m/%d %H:%M')}")
+                st.markdown(f"### {teams_line}")
+                st.caption("（この試合はキックオフ2時間前に個別ロック）")
 
-            # ★フォーム化（number_input変更ではrerunしない）＋ 未ベットは stake=0 表示
-            with st.form(f"bet_form_{match_id}", clear_on_submit=False):
+                if od:
+                    st.caption(f"Home: {home_odds:.2f} / Draw: {draw_odds:.2f} / Away: {away_odds:.2f}")
+                else:
+                    st.info("オッズ未入力のため仮オッズ (=1.0) を表示中。管理者は『オッズ管理』で設定してください。")
+                    st.caption(f"Home: {home_odds:.2f} / Draw: {draw_odds:.2f} / Away: {away_odds:.2f}")
+
+                if not is_odds_ready:
+                    st.warning("オッズ未確定のためベッティング不可。ブックメーカーが確定してください。")
+
+                # 参考：この試合に対する自分のサマリ
+                mine = [b for b in my_gw_bets if str(b.get("match_id")) == match_id]
+                summary = {"HOME":0,"DRAW":0,"AWAY":0}
+                for b in mine:
+                    summary[b.get("pick","")] = summary.get(b.get("pick",""),0) + parse_int(b.get("stake",0))
+                st.caption(f"現在のベット状況（あなた）: HOME {summary['HOME']} / DRAW {summary['DRAW']} / AWAY {summary['AWAY']}")
+
+                # 入力（フォーム内だが試合ごとにボタンは置かない）
                 c1, c2 = st.columns([2,1])
                 disabled_flag = (locked_this or (not is_odds_ready))
                 with c1:
@@ -335,45 +342,83 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
                 with c2:
                     stake = st.number_input(
                         "ステーク",
-                        min_value=0,             # ★未ベットは0、増減も可能
+                        min_value=0,
                         step=step,
-                        value=default_stake,     # ★既存値を初期表示
+                        value=default_stake,
                         key=f"stake_{match_id}",
                         disabled=disabled_flag
                     )
-                submitted = st.form_submit_button("この内容でベット", disabled=disabled_flag, use_container_width=True)
 
-            if submitted:
-                # ===== 二重防御：サーバー側でもオッズ未確定なら保存拒否 =====
-                if not is_odds_ready:
-                    st.warning("オッズ未確定のため、この試合にはまだベットできません。")
-                    st.stop()
+            # 後段の保存で使う情報を保持
+            picks[match_id] = pick
+            stakes[match_id] = int(stake)
+            defaults[match_id] = int(default_stake)
+            odds_map[match_id] = {"HOME": home_odds, "DRAW": draw_odds, "AWAY": away_odds}
+            meta_home[match_id] = m["home"]
+            locked_map[match_id] = locked_this
+            ready_map[match_id] = is_odds_ready
 
-                # ★上限チェックは差分で
-                existing = default_stake
-                proposed_total = my_total - existing + int(stake)
-                if proposed_total > max_total:
-                    st.warning(f"このGWの投票上限（{max_total:,}）を超えます。現在 {my_total:,} → 変更後 {proposed_total:,}")
-                else:
-                    use_odds = {"HOME": home_odds, "DRAW": draw_odds, "AWAY": away_odds}[pick]
-                    # ★同一試合は1行に上書きされるよう key を固定（タイムスタンプ削除）
-                    fixed_key = f"{gw_name}:{me['username']}:{match_id}"
-                    row = {
-                        "key": fixed_key,
-                        "gw": gw_name,
-                        "user": me["username"],
-                        "match_id": match_id,
-                        "match": m["home"],  # 列構成準拠
-                        "pick": pick,
-                        "stake": str(int(stake)),
-                        "odds": str(use_odds),
-                        "placed_at": datetime.utcnow().isoformat(timespec="seconds"),
-                        "status": "OPEN",
-                        "result": "", "payout": "", "net": "", "settled_at": "",
-                    }
-                    upsert_row("bets", row, key_col="key")
-                    st.success("ベットを更新しました。")
-                    st.rerun()
+        submitted_bulk = st.form_submit_button("このGWのベットを一括保存", use_container_width=True)
+
+    if submitted_bulk:
+        # ---- 上限チェック（差分合算）----
+        proposed_total = my_total
+        for mid in stakes.keys():
+            # ロック・未確定は保存対象外だが、入力しても差分に含めないようにする
+            if locked_map.get(mid) or not ready_map.get(mid):
+                continue
+            proposed_total += int(stakes[mid]) - int(defaults[mid])
+
+        if proposed_total > max_total:
+            st.warning(f"このGWの投票上限（{max_total:,}）を超えます。現在 {my_total:,} → 変更後 {proposed_total:,}")
+            return
+
+        # ---- 保存処理 ----
+        saved, skipped = 0, []
+        for mid in stakes.keys():
+            # スキップ理由を評価
+            if locked_map.get(mid):
+                skipped.append((mid, "ロック済のためスキップ"))
+                continue
+            if not ready_map.get(mid):
+                skipped.append((mid, "オッズ未確定のためスキップ"))
+                continue
+
+            new_pick = picks[mid]
+            new_stake = int(stakes[mid])
+            old_stake = int(defaults[mid])
+
+            # 変更なしならスキップ（無駄な書き込み防止）
+            # ※ pick 変更 or stake 変更 のどちらかがあれば保存
+            last = latest_my_bet_for_match(mid)
+            old_pick = (last.get("pick") if last else "HOME")
+            if (new_pick == old_pick) and (new_stake == old_stake):
+                continue
+
+            use_odds = odds_map[mid][new_pick]
+            fixed_key = f"{gw_name}:{me['username']}:{mid}"
+            row = {
+                "key": fixed_key,
+                "gw": gw_name,
+                "user": me["username"],
+                "match_id": mid,
+                "match": meta_home[mid],  # 列構成準拠（home）
+                "pick": new_pick,
+                "stake": str(int(new_stake)),
+                "odds": str(use_odds),
+                "placed_at": datetime.utcnow().isoformat(timespec="seconds"),
+                "status": "OPEN",
+                "result": "", "payout": "", "net": "", "settled_at": "",
+            }
+            upsert_row("bets", row, key_col="key")
+            saved += 1
+
+        if saved > 0:
+            st.success(f"ベットを一括保存しました（更新 {saved} 件）。")
+        if skipped:
+            msg = " / ".join([f"{k}: {reason}" for k, reason in skipped])
+            st.info(f"スキップ：{msg}")
+        st.rerun()
 
 # ------------------------------------------------------------
 # UI: 履歴（収支明示） － 既存維持
