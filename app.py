@@ -36,7 +36,7 @@ table {width:100%}
 /* トップの3分割カード（BM=赤、その他=グレー） */
 .role-cards{display:flex; gap:12px; flex-wrap:wrap}
 .role-card{flex:1 1 0; min-width:120px; border:1px solid rgba(120,120,120,.25); border-radius:12px; padding:12px 14px; background:rgba(255,255,255,.02)}
-.role-card.bm{border-color:rgba(255,0,0,.35); background:rgba(255,0,0,.08)}
+.role-card.bm{border-color:rgba(255,0,0,.35); background:rgba(255,255,255,.08)}
 .role-card .name{font-weight:700; font-size:1.05rem}
 .role-card .role{font-size:.9rem; color:rgba(255,255,255,.7)}
 .badges{display:flex; gap:8px; flex-wrap:wrap; margin-top:6px}
@@ -566,7 +566,7 @@ def page_realtime(conf: Dict[str, str], me: Dict):
         st.rerun()
 
 # ------------------------------------------------------------
-# UI: ダッシュボード － 既存維持
+# UI: ダッシュボード － ここだけ仕様変更（ログイン中ユーザー限定＋他ユーザー小表示）
 # ------------------------------------------------------------
 def page_dashboard(conf: Dict[str, str], me: Dict):
     st.markdown("## ダッシュボード")
@@ -576,14 +576,19 @@ def page_dashboard(conf: Dict[str, str], me: Dict):
         st.info("データがありません。")
         return
 
-    total_stake = sum(parse_int(b.get("stake", 0)) for b in bets)
-    total_payout = sum(parse_float(b.get("payout"), 0.0) or 0.0 for b in bets if b.get("result") in ["WIN","LOSE"])
+    # ---- 上部KPI：ログイン中ユーザー限定 ----
+    my_name = me.get("username")
+    my_bets = [b for b in bets if b.get("user") == my_name]
+
+    total_stake = sum(parse_int(b.get("stake", 0)) for b in my_bets)
+    total_payout = sum((parse_float(b.get("payout"), 0.0) or 0.0)
+                       for b in my_bets if (b.get("result") in ["WIN", "LOSE"]))
     total_net = total_payout - total_stake
 
     st.markdown(
         f"""
         <div class="kpi-row">
-          <div class="kpi"><div class="h">トータル収支</div><div class="v">{total_net:,.2f}</div></div>
+          <div class="kpi"><div class="h">トータル収支（{my_name}）</div><div class="v">{total_net:,.2f}</div></div>
           <div class="kpi"><div class="h">総支出額（stake）</div><div class="v">{total_stake:,}</div></div>
           <div class="kpi"><div class="h">トータル収入額（payout）</div><div class="v">{total_payout:,.2f}</div></div>
         </div>
@@ -591,10 +596,31 @@ def page_dashboard(conf: Dict[str, str], me: Dict):
         unsafe_allow_html=True,
     )
 
+    # ---- 他ユーザーの参考ミニカード ----
+    users = sorted(list({b.get("user") for b in bets if b.get("user")}))
+    others = [u for u in users if u != my_name]
+    if others:
+        st.markdown('<div class="section">他ユーザー（参考）</div>', unsafe_allow_html=True)
+        cols = st.columns(max(2, min(4, len(others))))
+        for i, u in enumerate(others):
+            ub = [b for b in bets if b.get("user") == u]
+            ustake = sum(parse_int(b.get("stake", 0)) for b in ub)
+            upayout = sum((parse_float(b.get("payout"), 0.0) or 0.0)
+                          for b in ub if (b.get("result") in ["WIN", "LOSE"]))
+            unat = upayout - ustake
+            with cols[i % len(cols)]:
+                st.markdown(
+                    f'<div class="kpi"><div class="h">{u}</div>'
+                    f'<div class="v">{unat:,.2f}</div>'
+                    f'<div class="h">stake {ustake:,} / payout {upayout:,.2f}</div></div>',
+                    unsafe_allow_html=True
+                )
+
+    # ---- 的中率が高いチーム TOP3（ログイン中ユーザーのみ、最低3ベット）----
     st.markdown('<div class="section">ユーザー別：的中率が高いチーム TOP3（最低3ベット）</div>', unsafe_allow_html=True)
 
-    by_user_team = {}
-    for b in bets:
+    by_team = {}
+    for b in my_bets:
         if (b.get("result") or "").upper() not in ["WIN", "LOSE"]:
             continue
         pick = b.get("pick")
@@ -606,25 +632,22 @@ def page_dashboard(conf: Dict[str, str], me: Dict):
         else:
             continue
 
-        u = b.get("user", "")
-        by_user_team.setdefault(u, {}).setdefault(team, {"n": 0, "win": 0, "net": 0.0})
-        by_user_team[u][team]["n"] += 1
+        by_team.setdefault(team, {"n": 0, "win": 0, "net": 0.0})
+        by_team[team]["n"] += 1
         if (b.get("result") or "").upper() == "WIN":
-            by_user_team[u][team]["win"] += 1
-            by_user_team[u][team]["net"] += (parse_float(b.get("payout"), 0.0) or 0.0) - parse_int(b.get("stake", 0))
+            by_team[team]["win"] += 1
+            by_team[team]["net"] += (parse_float(b.get("payout"), 0.0) or 0.0) - parse_int(b.get("stake", 0))
         else:
-            by_user_team[u][team]["net"] -= parse_int(b.get("stake", 0))
+            by_team[team]["net"] -= parse_int(b.get("stake", 0))
 
-    for u, teams in by_user_team.items():
-        st.markdown(f"**{u}**")
-        stats = []
-        for t, v in teams.items():
-            if v["n"] >= 3:
-                acc = v["win"] / v["n"]
-                stats.append((t, acc, v["n"], v["net"]))
-        if not stats:
-            st.caption("　対象データ不足（3ベット未満）")
-            continue
+    stats = []
+    for t, v in by_team.items():
+        if v["n"] >= 3:
+            acc = v["win"] / v["n"]
+            stats.append((t, acc, v["n"], v["net"]))
+    if not stats:
+        st.caption("　対象データ不足（3ベット未満）")
+    else:
         stats.sort(key=lambda x: (-x[1], -x[3]))
         for t, acc, n, net in stats[:3]:
             st.caption(f"　- {t}: 的中率 {acc*100:.1f}%（{n}件）／ 累計net {net:,.2f}")
