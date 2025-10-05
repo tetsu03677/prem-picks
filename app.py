@@ -363,7 +363,7 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
 # UI: 履歴（収支明示） － 既存維持
 # ------------------------------------------------------------
 def page_history(conf: Dict[str, str], me: Dict):
-    st.markdown("## 屴歴")
+    st.markdown("## 履歴")
 
     bets = read_rows_by_sheet("bets")
     if not bets:
