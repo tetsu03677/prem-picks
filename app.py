@@ -129,6 +129,8 @@ def login_ui(conf: Dict[str, str]) -> Dict:
                 st.session_state["signed_in"] = True
                 st.session_state["me"] = selected
                 st.success(f"ようこそ {selected['username']} さん！")
+                # ログイン成功時に一度だけ同期フラグを落とす
+                st.session_state.pop("_synced_once", None)
                 st.rerun()
             else:
                 st.warning("ユーザー名またはパスワードが違います。")
@@ -181,6 +183,88 @@ def get_bookmaker_for_gw(gw_name: str) -> str:
             # 列名の揺れに対応（bookmaker or user）
             return str(r.get("bookmaker") or r.get("user") or "").strip()
     return ""
+
+# ------------------------------------------------------------
+# ★★★ 追加：結果同期＋自動精算（result & bets を更新） ★★★
+# ------------------------------------------------------------
+def sync_results_and_settle(conf: Dict[str, str]):
+    """resultシートに確定スコアを反映し、betsを自動精算する。安全のため冪等。"""
+    try:
+        # 候補となる試合ID（odds と bets から集約）
+        odds_rows = read_rows_by_sheet("odds") or []
+        bets_rows = read_rows_by_sheet("bets") or []
+        candidate_ids = sorted({str(r.get("match_id")) for r in odds_rows if r.get("match_id")} |
+                               {str(r.get("match_id")) for r in bets_rows if r.get("match_id")})
+        if not candidate_ids:
+            return
+
+        # 既存の結果マップ
+        result_rows = read_rows_by_sheet("result") or []
+        result_by_id = {str(r.get("match_id")): r for r in result_rows if r.get("match_id")}
+
+        # APIから最新スコア（まとめて）
+        scores = fetch_scores_for_match_ids(conf, candidate_ids) or {}
+
+        # 1) result を更新／追加（FINISHED or AWARDED のみ）
+        updated_any = False
+        for mid in candidate_ids:
+            sc = scores.get(mid) or {}
+            status = (sc.get("status") or "").upper()
+            if status not in ("FINISHED", "AWARDED"):
+                continue
+            home_score = parse_int(sc.get("home_score"), 0)
+            away_score = parse_int(sc.get("away_score"), 0)
+            winner = "DRAW" if home_score == away_score else ("HOME" if home_score > away_score else "AWAY")
+            exist = result_by_id.get(mid) or {}
+            # 変更があるときのみ書き込み
+            if (parse_int(exist.get("home_score"), -999) != home_score) or \
+               (parse_int(exist.get("away_score"), -999) != away_score) or \
+               ((exist.get("status") or "").upper() != status):
+                row = {
+                    "match_id": mid,
+                    "gw": exist.get("gw") or next((r.get("gw") for r in odds_rows if str(r.get("match_id")) == mid), ""),
+                    "home": exist.get("home") or next((r.get("home") for r in odds_rows if str(r.get("match_id")) == mid), ""),
+                    "away": exist.get("away") or next((r.get("away") for r in odds_rows if str(r.get("match_id")) == mid), ""),
+                    "home_score": str(home_score),
+                    "away_score": str(away_score),
+                    "winner": winner,
+                    "status": status,
+                    "finished_at": sc.get("finished_at") or "",
+                    "updated_at": datetime.utcnow().isoformat(timespec="seconds"),
+                }
+                upsert_row("result", row, key_col="match_id")
+                result_by_id[mid] = row
+                updated_any = True
+
+        # 2) bets を自動精算（OPEN で result があるもの）
+        if result_by_id:
+            for b in bets_rows:
+                if (b.get("status") or "").upper() != "OPEN":
+                    continue
+                mid = str(b.get("match_id"))
+                res = result_by_id.get(mid)
+                if not res:
+                    continue
+                stake = parse_int(b.get("stake"), 0)
+                odds = parse_float(b.get("odds"), 1.0) or 1.0
+                pick = (b.get("pick") or "").upper()
+                winner = (res.get("winner") or "").upper()
+                win_flag = (pick == winner)
+                payout = float(stake) * float(odds) if win_flag else 0.0
+                net = payout - float(stake)
+                row = dict(b)
+                row.update({
+                    "status": "SETTLED",
+                    "result": "WIN" if win_flag else "LOSE",
+                    "payout": f"{payout:.2f}",
+                    "net": f"{net:.2f}",
+                    "settled_at": datetime.utcnow().isoformat(timespec="seconds"),
+                })
+                upsert_row("bets", row, key_col="key")
+        # 何もなくても黙って終了（冪等）
+    except Exception:
+        # 同期失敗はUIに影響しないよう握りつぶし
+        pass
 
 # ------------------------------------------------------------
 # UI: トップ（BM表示＋カウンタ） － 既存維持
@@ -418,7 +502,7 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
         if skipped:
             msg = " / ".join([f"{k}: {reason}" for k, reason in skipped])
             st.info(f"スキップ：{msg}")
-        st.rerun()
+        # ★ rerunしない（タブ遷移防止）
 
 # ------------------------------------------------------------
 # UI: 履歴（収支明示） － 既存維持
@@ -759,7 +843,7 @@ def page_odds_admin(conf: Dict[str, str], me: Dict):
                         }
                         upsert_row("odds", row, key_cols=["match_id", "gw"])
                         st.success("保存しました。")
-                        st.rerun()
+                        # ★ rerunしない（タブ遷移防止）
 
 # ------------------------------------------------------------
 # メイン
@@ -770,6 +854,11 @@ def main():
     me = login_ui(conf)
     if not me:
         st.stop()
+
+    # ★ ログイン後に一度だけ同期（result更新＆bets精算）
+    if not st.session_state.get("_synced_once"):
+        sync_results_and_settle(conf)
+        st.session_state["_synced_once"] = True
 
     tabs = st.tabs(["トップ", "試合とベット", "履歴", "リアルタイム", "ダッシュボード", "オッズ管理"])
 
