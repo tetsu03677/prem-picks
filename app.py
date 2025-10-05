@@ -169,6 +169,19 @@ def _pick_next_bm(users: List[str], counts: Dict[str, int]) -> str:
     order = {u: i for i, u in enumerate(users)}
     return sorted(users, key=lambda u: (counts.get(u, 0), order[u]))[0] if users else ""
 
+# ========== 追加：このGWのブックメーカーを取得 ==========
+def get_bookmaker_for_gw(gw_name: str) -> str:
+    """bm_log から該当GWのBM名を返す。'GW7' と '7' の両方に対応。"""
+    rows = read_rows_by_sheet("bm_log") or []
+    targets = {str(gw_name).strip(), str(gw_name).replace("GW", "").strip()}
+    for r in rows:
+        gw_cell = str(r.get("gw", "")).strip()
+        gw_num = str(r.get("gw_number", "")).strip()
+        if gw_cell in targets or gw_num in targets:
+            # 列名の揺れに対応（bookmaker or user）
+            return str(r.get("bookmaker") or r.get("user") or "").strip()
+    return ""
+
 # ------------------------------------------------------------
 # UI: トップ（BM表示＋カウンタ） － 既存維持
 # ------------------------------------------------------------
@@ -214,6 +227,12 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
 
     matches_raw, gw = fetch_matches_next_gw(conf, day_window=7)
     gw_name, _, _ = gw_and_lock_state(conf, matches_raw)  # 参照のみ（全体ロックは使わない）
+
+    # ===== 追加：BMはこのページでベット禁止 =====
+    current_bm = get_bookmaker_for_gw(gw_name)
+    if current_bm and me.get("username") == current_bm:
+        st.warning("このGWはあなたがブックメーカーです。ベッティングは禁止です。")
+        return
 
     bets_all = read_rows_by_sheet("bets")
     # 自分のこのGWのベット一覧
@@ -474,18 +493,34 @@ def page_realtime(conf: Dict[str, str], me: Dict):
         unsafe_allow_html=True,
     )
 
-    # ユーザー別の時点収支
+    # ===== 変更：ユーザー別の時点収支（BMは他プレイヤー合算の逆符号） =====
     users = sorted(list({b.get("user") for b in this_gw_bets if b.get("user")}))
+    current_bm = get_bookmaker_for_gw(gw)
     if users:
         st.markdown('<div class="section">ユーザー別の時点収支</div>', unsafe_allow_html=True)
-        cols = st.columns(max(2, min(4, len(users))))
-        for i, u in enumerate(users):
+        # まずBM以外の暫定収支を計算
+        user_net = {}
+        for u in users:
             ub = [b for b in this_gw_bets if b.get("user") == u]
             ustake = sum(parse_int(b.get("stake", 0)) for b in ub)
             upayout = sum(current_payout(b) for b in ub)
-            unat = upayout - ustake
+            user_net[u] = upayout - ustake
+
+        # BMの暫定収支を上書き（= 他プレイヤー合算のマイナス）
+        if current_bm:
+            others_net_sum = sum(v for k, v in user_net.items() if k != current_bm)
+            user_net[current_bm] = -others_net_sum
+
+        # 表示
+        disp_users = list(users)
+        cols = st.columns(max(2, min(4, len(disp_users))))
+        for i, u in enumerate(disp_users):
+            ub = [b for b in this_gw_bets if b.get("user") == u]
+            ustake = sum(parse_int(b.get("stake", 0)) for b in ub)
+            upayout = sum(current_payout(b) for b in ub)
+            unat = user_net.get(u, upayout - ustake)
             with cols[i % len(cols)]:
-                st.markdown(f'<div class="kpi"><div class="h">{u}</div><div class="v">{unat:,.2f}</div><div class="h">stake {ustake:,} / payout {upayout:,.2f}</div></div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="kpi"><div class="h">{u}{"（BM）" if u==current_bm else ""}</div><div class="v">{unat:,.2f}</div><div class="h">stake {ustake:,} / payout {upayout:,.2f}</div></div>', unsafe_allow_html=True)
 
     # 試合別（未開始＋進行中のみ）
     st.markdown('<div class="section">試合別（現在スコアに基づく暫定：未開始＋進行中）</div>', unsafe_allow_html=True)
