@@ -3,3 +3,4 @@ requests>=2.31
 python-dateutil>=2.9
 gspread>=6.1.2
 google-auth>=2.33
+pytz>=2023.3
