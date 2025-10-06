@@ -135,7 +135,7 @@ def login_ui(conf: Dict[str, str]) -> Dict:
                 st.session_state.pop("_synced_once", None)
                 st.rerun()
             else:
-                st.warning("ユーザー名またはパスワードが違います。」)
+                st.warning("ユーザー名またはパスワードが違います。」")
 
         st.markdown("</div>", unsafe_allow_html=True)
 
