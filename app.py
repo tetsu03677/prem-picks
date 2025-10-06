@@ -265,14 +265,26 @@ def _is_gw_finished(conf: Dict[str, str], gw_label: str) -> bool:
 # ★ 変更：bm_log の「最新GW+1」を“次節”として自動確定して追記（より厳密）
 def auto_assign_bm_if_needed(conf: Dict[str, str]):
     try:
+        # ▼▼▼ ここだけ追加：gw_max のガード ▼▼▼
+        gw_max = parse_int(conf.get("gw_max", 38), 38)
+
         latest_n = _get_latest_gw_number_in_bm_log()
         if latest_n is None:
             # 初期化されていない場合は何もしない（種行は手動で作成してください）
             return
 
+        # シーズン最終節（gw_max）に到達／超過していたら以降は追加しない
+        if latest_n >= gw_max:
+            return
+
         prev_label = f"GW{latest_n}"  # 直近に確定済みのGW
         next_n = latest_n + 1
         next_label = f"GW{next_n}"
+
+        # gw_max を超えるGWは作らない
+        if next_n > gw_max:
+            return
+        # ▲▲▲ 追加はここまで ▲▲▲
 
         # すでに「最新GW+1」が確定済みなら何もしない
         if get_bookmaker_for_gw(next_label):
