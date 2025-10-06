@@ -4,7 +4,6 @@ from typing import Dict, List, Tuple
 
 import pytz
 import streamlit as st
-import time  # ★ 追加
 
 from google_sheets_client import (
     read_config_map,
@@ -222,6 +221,26 @@ def get_bookmaker_for_gw(gw_name: str) -> str:
             return str(r.get("bookmaker") or r.get("user") or "").strip()
     return ""
 
+# ★ 追加：bm_log の最新GW番号を返す（なければ None）
+def _get_latest_gw_number_in_bm_log() -> int:
+    try:
+        rows = read_rows_by_sheet("bm_log") or []
+        cand = []
+        for r in rows:
+            n = None
+            if r.get("gw_number"):
+                try:
+                    n = int(str(r["gw_number"]).strip())
+                except Exception:
+                    n = None
+            if n is None and r.get("gw"):
+                n = _parse_gw_number(r["gw"])
+            if n is not None:
+                cand.append(n)
+        return max(cand) if cand else None
+    except Exception:
+        return None
+
 # ★ 追加：前節が全試合確定かを判定
 def _is_gw_finished(conf: Dict[str, str], gw_label: str) -> bool:
     try:
@@ -243,31 +262,37 @@ def _is_gw_finished(conf: Dict[str, str], gw_label: str) -> bool:
     except Exception:
         return False
 
-# ★ 追加：必要なら次節BMを自動確定して bm_log に1行追記
+# ★ 変更：bm_log の「最新GW+1」を“次節”として自動確定して追記（より厳密）
 def auto_assign_bm_if_needed(conf: Dict[str, str]):
     try:
-        matches_next, next_gw = fetch_matches_next_gw(conf, day_window=7)
-        if not next_gw:
+        latest_n = _get_latest_gw_number_in_bm_log()
+        if latest_n is None:
+            # 初期化されていない場合は何もしない（種行は手動で作成してください）
             return
-        # すでに次節のBMが確定済みなら何もしない
-        if get_bookmaker_for_gw(next_gw):
+
+        prev_label = f"GW{latest_n}"  # 直近に確定済みのGW
+        next_n = latest_n + 1
+        next_label = f"GW{next_n}"
+
+        # すでに「最新GW+1」が確定済みなら何もしない
+        if get_bookmaker_for_gw(next_label):
             return
-        n = _parse_gw_number(next_gw)
-        if not n or n <= 1:
-            return
-        prev_label = f"GW{n-1}"
+
+        # 前節（最新GW）が全試合確定していなければ次節は確定しない
         if not _is_gw_finished(conf, prev_label):
-            return  # 前節が未確定
-        # ユーザーの並び順と既存回数から次BMを選出
+            return
+
+        # ユーザーの並び順と既存回数から次のBMを選出
         users_conf = get_users(conf)
         users = [u["username"] for u in users_conf]
         counts = _get_bm_counts(users)
         next_bm = _pick_next_bm(users, counts)
         if not next_bm:
             return
+
         row = {
-            "gw": f"GW{n}",
-            "gw_number": str(n),
+            "gw": next_label,
+            "gw_number": str(next_n),
             "bookmaker": next_bm,
             "decided_at": datetime.utcnow().isoformat(timespec="seconds"),
         }
@@ -275,26 +300,6 @@ def auto_assign_bm_if_needed(conf: Dict[str, str]):
         upsert_row("bm_log", row, key_cols=["gw", "gw_number"])
     except Exception:
         # 自動確定失敗はUIに影響しないよう握りつぶし
-        pass
-
-# ★ 追加：初回ログイン時に「次節BMお知らせ」を10秒だけ表示（端末内1回）
-def show_bm_notice_if_needed(conf: Dict[str, str], me: Dict):
-    try:
-        _, gw = fetch_matches_next_gw(conf, day_window=30)  # 試合が離れていても拾う
-        if not gw:
-            return
-        bm = get_bookmaker_for_gw(gw)
-        if not bm:
-            return
-        key = f"_bm_notice_seen:{gw}:{me.get('username')}"
-        if st.session_state.get(key):
-            return
-        placeholder = st.empty()
-        placeholder.info(f"次節のBMは {bm} です。{bm} 以外のメンバーは『試合とベット』よりベッティングを行ってください。", icon="🔔")
-        time.sleep(10)
-        placeholder.empty()
-        st.session_state[key] = True
-    except Exception:
         pass
 
 # ------------------------------------------------------------
@@ -1077,12 +1082,9 @@ def main():
     # ★ ログイン後に一度だけ同期（result更新＆bets精算）
     if not st.session_state.get("_synced_once"):
         sync_results_and_settle(conf)
-        # ★ 追加：前節が確定していれば次節BMを自動確定し bm_log に追記
+        # ★ 変更：bm_log の最新GW+1を“次節”とみなして確定
         auto_assign_bm_if_needed(conf)
         st.session_state["_synced_once"] = True
-
-    # ★ 追加：BM確定済みなら初回だけ10秒通知
-    show_bm_notice_if_needed(conf, me)
 
     tabs = st.tabs(["トップ", "試合とベット", "履歴", "リアルタイム", "ダッシュボード", "オッズ管理"])
 
