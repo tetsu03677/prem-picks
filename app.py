@@ -549,7 +549,7 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
             st.info(f"スキップ：{msg}")
 
 # ------------------------------------------------------------
-# UI: 履歴（既存維持）
+# UI: 履歴（★ここだけ最小改修：ユーザー切替を追加）
 # ------------------------------------------------------------
 def page_history(conf: Dict[str, str], me: Dict):
     st.markdown("## 履歴")
@@ -559,27 +559,54 @@ def page_history(conf: Dict[str, str], me: Dict):
         st.info("履歴はまだありません。")
         return
 
+    # 1) 既存のGWセレクトは維持
     gw_vals = {(b.get("gw") if b.get("gw") not in (None, "") else "") for b in bets}
     gw_set = sorted(gw_vals, key=_gw_sort_key)
     sel_gw = st.selectbox("表示するGW", gw_set, index=0 if gw_set else None, key="hist_gw")
 
-    target = [b for b in bets if (b.get("gw") == sel_gw)]
+    # 2) 追加：ユーザー切替（既定=自分、必要なら他人も）
+    all_users = sorted({b.get("user") for b in bets if b.get("user")})
+    my_name = me.get("username")
+    admin_only = str(conf.get("admin_only_view_others", "false")).lower() == "true"
+    can_view_others = (me.get("role") == "admin") or (not admin_only)
+
+    # セレクタの候補（自分＋許可されている場合のみ他人）
+    opts = [my_name] + [u for u in all_users if u != my_name and can_view_others]
+    # ラベルをわかりやすく（自分にはマーク）
+    label_map = {u: (f"{u}（自分）" if u == my_name else u) for u in opts}
+    # 表示はラベルだが、内部はユーザー名で扱う
+    sel_label = st.selectbox(
+        "ユーザー",
+        [label_map[u] for u in opts],
+        index=0,
+        key="hist_user",
+        help="既定は自分。他ユーザーはプレビュー表示（編集はできません）。"
+    )
+    # 逆引き
+    inv_label = {v: k for k, v in label_map.items()}
+    sel_user = inv_label.get(sel_label, my_name)
+
+    # 3) 絞り込み：選択GW × 選択ユーザー
+    target = [b for b in bets if (b.get("gw") == sel_gw and b.get("user") == sel_user)]
     if not target:
         st.info("対象のデータがありません。")
         return
 
+    # 4) KPI（選択ユーザーで再計算）
     total_stake = sum(parse_int(b.get("stake", 0)) for b in target)
     total_payout = sum(parse_float(b.get("payout"), 0.0) or 0.0 for b in target if (b.get("result") in ["WIN","LOSE"]))
     total_net = total_payout - total_stake
+    badge = "（閲覧）" if sel_user != my_name else ""
     kpi_html = f"""
     <div class="kpi-row">
-      <div class="kpi"><div class="h">合計ステーク</div><div class="v">{total_stake:,}</div></div>
-      <div class="kpi"><div class="h">合計ペイアウト</div><div class="v">{total_payout:,.2f}</div></div>
-      <div class="kpi"><div class="h">合計収支</div><div class="v">{total_net:,.2f}</div></div>
+      <div class="kpi"><div class="h">合計ステーク（{sel_user}{badge}）</div><div class="v">{total_stake:,}</div></div>
+      <div class="kpi"><div class="h">合計ペイアウト（{sel_user}{badge}）</div><div class="v">{total_payout:,.2f}</div></div>
+      <div class="kpi"><div class="h">合計収支（{sel_user}{badge}）</div><div class="v">{total_net:,.2f}</div></div>
     </div>
     """
     st.markdown(kpi_html, unsafe_allow_html=True)
 
+    # 5) 明細（そのユーザーのみ）
     def row_view(b):
         stake = parse_int(b.get("stake", 0))
         odds = parse_float(b.get("odds"), 1.0) or 1.0
