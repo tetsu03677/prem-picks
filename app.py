@@ -190,41 +190,55 @@ def get_bookmaker_for_gw(gw_name: str) -> str:
 def sync_results_and_settle(conf: Dict[str, str]):
     """resultシートに確定スコアを反映し、betsを自動精算する。安全のため冪等。"""
     try:
-        # 候補となる試合ID（odds と bets から集約）
+        # odds/bets を読み込み
         odds_rows = read_rows_by_sheet("odds") or []
         bets_rows = read_rows_by_sheet("bets") or []
-        candidate_ids = sorted({str(r.get("match_id")) for r in odds_rows if r.get("match_id")} |
-                               {str(r.get("match_id")) for r in bets_rows if r.get("match_id")})
-        if not candidate_ids:
+
+        # 内部ID→FD ID のマップ（odds 起点）
+        in2fd = {}
+        meta_by_fd = {}
+        for r in odds_rows:
+            in_id = str(r.get("match_id") or "").strip()
+            fd_id = str(r.get("fd_match_id") or "").strip()
+            if fd_id:
+                in2fd[in_id] = fd_id
+                meta_by_fd[fd_id] = {
+                    "gw": r.get("gw", ""),
+                    "home": r.get("home", ""),
+                    "away": r.get("away", ""),
+                }
+
+        # API問い合わせは FD ID のみ
+        candidate_fd_ids = sorted({v for v in in2fd.values() if v})
+        if not candidate_fd_ids:
             return
 
-        # 既存の結果マップ
+        # 既存の結果マップ（キー=FD ID）
         result_rows = read_rows_by_sheet("result") or []
-        result_by_id = {str(r.get("match_id")): r for r in result_rows if r.get("match_id")}
+        result_by_fd = {str(r.get("match_id")): r for r in result_rows if r.get("match_id")}
 
-        # APIから最新スコア（まとめて）
-        scores = fetch_scores_for_match_ids(conf, candidate_ids) or {}
+        # 最新スコア取得（FD ID）
+        scores = fetch_scores_for_match_ids(conf, candidate_fd_ids) or {}
 
         # 1) result を更新／追加（FINISHED or AWARDED のみ）
-        updated_any = False
-        for mid in candidate_ids:
-            sc = scores.get(mid) or {}
+        for fd in candidate_fd_ids:
+            sc = scores.get(fd) or {}
             status = (sc.get("status") or "").upper()
             if status not in ("FINISHED", "AWARDED"):
                 continue
             home_score = parse_int(sc.get("home_score"), 0)
             away_score = parse_int(sc.get("away_score"), 0)
             winner = "DRAW" if home_score == away_score else ("HOME" if home_score > away_score else "AWAY")
-            exist = result_by_id.get(mid) or {}
-            # 変更があるときのみ書き込み
+            exist = result_by_fd.get(fd) or {}
+            meta = meta_by_fd.get(fd, {})
             if (parse_int(exist.get("home_score"), -999) != home_score) or \
                (parse_int(exist.get("away_score"), -999) != away_score) or \
                ((exist.get("status") or "").upper() != status):
                 row = {
-                    "match_id": mid,
-                    "gw": exist.get("gw") or next((r.get("gw") for r in odds_rows if str(r.get("match_id")) == mid), ""),
-                    "home": exist.get("home") or next((r.get("home") for r in odds_rows if str(r.get("match_id")) == mid), ""),
-                    "away": exist.get("away") or next((r.get("away") for r in odds_rows if str(r.get("match_id")) == mid), ""),
+                    "match_id": fd,                # ← result の主キーは FD ID
+                    "gw": exist.get("gw") or meta.get("gw", ""),
+                    "home": exist.get("home") or meta.get("home", ""),
+                    "away": exist.get("away") or meta.get("away", ""),
                     "home_score": str(home_score),
                     "away_score": str(away_score),
                     "winner": winner,
@@ -233,16 +247,18 @@ def sync_results_and_settle(conf: Dict[str, str]):
                     "updated_at": datetime.utcnow().isoformat(timespec="seconds"),
                 }
                 upsert_row("result", row, key_col="match_id")
-                result_by_id[mid] = row
-                updated_any = True
+                result_by_fd[fd] = row
 
         # 2) bets を自動精算（OPEN で result があるもの）
-        if result_by_id:
+        if result_by_fd:
             for b in bets_rows:
                 if (b.get("status") or "").upper() != "OPEN":
                     continue
-                mid = str(b.get("match_id"))
-                res = result_by_id.get(mid)
+                internal_mid = str(b.get("match_id") or "").strip()
+                fd_id = in2fd.get(internal_mid)  # bets.match_id → FD ID に変換
+                if not fd_id:
+                    continue
+                res = result_by_fd.get(fd_id)
                 if not res:
                     continue
                 stake = parse_int(b.get("stake"), 0)
@@ -561,7 +577,7 @@ def page_realtime(conf: Dict[str, str], me: Dict):
     matches_raw, gw = fetch_matches_next_gw(conf, day_window=7)
     if not matches_raw:
         st.info("試合が見つかりません（APIが403の場合は時間をおいて再試行ください）。")
-    # APIから得られた“これからの試合”
+    # APIから得られた“これからの試合”（ここはAPIのID=FD ID想定）
     api_ids = [str(m["id"]) for m in matches_raw]
     api_meta = {str(m["id"]): {"home": m["home"], "away": m["away"], "utc_kickoff": m.get("utc_kickoff")} for m in matches_raw}
 
@@ -572,42 +588,67 @@ def page_realtime(conf: Dict[str, str], me: Dict):
     gw_odds = [r for r in odds_rows if str(r.get("gw", "")) == str(gw)]
     gw_bets = [r for r in bets_rows if str(r.get("gw", "")) == str(gw)]
 
+    # 内部→FD 変換（このGWのみ）
+    in2fd = {}
+    for r in gw_odds:
+        in_id = str(r.get("match_id") or "").strip()
+        fd_id = str(r.get("fd_match_id") or "").strip()
+        if fd_id:
+            in2fd[in_id] = fd_id
+
     def has_teams(r):
         return bool(str(r.get("home","")).strip() and str(r.get("away","")).strip())
 
-    odds_ids = [str(r.get("match_id")) for r in gw_odds if r.get("match_id") and has_teams(r)]
-    bet_ids = [str(r.get("match_id")) for r in gw_bets if r.get("match_id")]
+    # FD IDで候補集合を作る
+    odds_ids = [str(r.get("fd_match_id")) for r in gw_odds if r.get("fd_match_id") and has_teams(r)]
+    bet_ids = []
+    for r in gw_bets:
+        internal_mid = str(r.get("match_id") or "").strip()
+        fd = in2fd.get(internal_mid)
+        if fd:
+            bet_ids.append(fd)
 
-    # メタ情報補完（oddsにhome/awayがあるものだけ）
+    # メタ情報補完（oddsにhome/awayがあるものだけをFD IDで保持）
     for r in gw_odds:
-        mid = str(r.get("match_id"))
-        if mid and mid not in api_meta and has_teams(r):
-            api_meta[mid] = {"home": r.get("home"), "away": r.get("away"), "utc_kickoff": None}
+        fd = str(r.get("fd_match_id") or "")
+        if fd and fd not in api_meta and has_teams(r):
+            api_meta[fd] = {"home": r.get("home"), "away": r.get("away"), "utc_kickoff": None}
 
     candidate_ids = sorted(list({*api_ids, *odds_ids, *bet_ids}))
 
-    # スコア取得
+    # スコア取得（FD IDで）
     scores = fetch_scores_for_match_ids(conf, candidate_ids)
 
     # ★終了済みは除外（未開始・進行中のみ）
-    def is_active(mid):
-        s = scores.get(mid, {})
+    def is_active(fd):
+        s = scores.get(fd, {})
         status = (s.get("status") or "").upper()
         return status not in ("FINISHED", "AWARDED")  # それ以外（SCHEDULED/TIMED/IN_PLAY等）は表示
 
-    active_ids = [mid for mid in candidate_ids if is_active(mid)]
+    active_ids = [fd for fd in candidate_ids if is_active(fd)]
+
+    # オッズ参照を FD ID で
+    odds_by_fd = {}
+    for r in gw_odds:
+        fd = str(r.get("fd_match_id") or "")
+        if fd:
+            odds_by_fd[fd] = r
 
     # KPI（既存ロジック維持：GW全体のベットに対する時点想定。表示はactiveのみ）
     def current_payout(b):
-        mid = str(b.get("match_id"))
+        internal_mid = str(b.get("match_id") or "").strip()
+        fd = in2fd.get(internal_mid)
+        if not fd:
+            return 0.0
         stake = parse_int(b.get("stake", 0))
         pick = b.get("pick", "")
-        odds_by_match = {str(r.get("match_id")): r for r in gw_odds if r.get("match_id")}
-        odds = parse_float(b.get("odds"), None) or parse_float(
-            odds_by_match.get(mid, {}).get({"HOME":"home_win","DRAW":"draw","AWAY":"away_win"}[pick]),
-            1.0
-        )
-        sc = scores.get(mid)
+        # bet.odds を優先、なければオッズ表から
+        odds = parse_float(b.get("odds"), None)
+        if odds is None:
+            odrow = odds_by_fd.get(fd, {})
+            odds_key = {"HOME":"home_win","DRAW":"draw","AWAY":"away_win"}.get(pick)
+            odds = parse_float(odrow.get(odds_key), 1.0)
+        sc = scores.get(fd)
         if not sc:
             return 0.0
         status = sc.get("status")
@@ -670,20 +711,24 @@ def page_realtime(conf: Dict[str, str], me: Dict):
     # 試合別（未開始＋進行中のみ）
     st.markdown('<div class="section">試合別（現在スコアに基づく暫定：未開始＋進行中）</div>', unsafe_allow_html=True)
 
-    def kickoff_key(mid):
-        info = api_meta.get(mid, {})
+    def kickoff_key(fd):
+        info = api_meta.get(fd, {})
         ko = info.get("utc_kickoff")
         return (0, ko) if ko else (1, None)
 
-    for mid in sorted(active_ids, key=kickoff_key):
-        info = api_meta.get(mid)
+    # bets の行を FD ID で絞り込むためのヘルパ
+    def bet_fd(b):
+        return in2fd.get(str(b.get("match_id") or "").strip())
+
+    for fd in sorted(active_ids, key=kickoff_key):
+        info = api_meta.get(fd)
         if not info:
             # メタが無い（home/away欠損など）は表示しない
             continue
-        s = scores.get(mid, {})
+        s = scores.get(fd, {})
         hs, as_ = s.get("home_score", 0), s.get("away_score", 0)
         st.markdown(f"**{info['home']} vs {info['away']}**　（{s.get('status','-')}　{hs}-{as_}）")
-        rows = [b for b in this_gw_bets if str(b.get("match_id")) == mid]
+        rows = [b for b in this_gw_bets if bet_fd(b) == fd]
         if not rows:
             st.caption("（ベットなし）")
             continue
