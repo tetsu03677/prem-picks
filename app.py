@@ -302,6 +302,26 @@ def auto_assign_bm_if_needed(conf: Dict[str, str]):
         # 自動確定失敗はUIに影響しないよう握りつぶし
         pass
 
+# ★ 追加：次節BMのトースト通知（セッション内で初回だけ）
+def _toast_next_bm_once(conf: Dict[str, str], me: Dict):
+    try:
+        if st.session_state.get("_bm_toast_done"):
+            return
+        latest_n = _get_latest_gw_number_in_bm_log()
+        if latest_n is None:
+            return
+        next_label = f"GW{latest_n+1}"
+        bm = get_bookmaker_for_gw(next_label)
+        if not bm:
+            return
+        if me and me.get("username") == bm:
+            st.toast(f"次節 {next_label} のBMはあなた（{bm}）です。オッズを確定してください。", icon="✅")
+        else:
+            st.toast(f"次節 {next_label} のBMは {bm} です。BM以外のメンバーは『試合とベット』からベッティングしてください。", icon="ℹ️")
+        st.session_state["_bm_toast_done"] = True
+    except Exception:
+        pass
+
 # ------------------------------------------------------------
 # ★★★ 追加：結果同期＋自動精算（result & bets を更新）＋ fd_match_id 自動補完 ★★★
 # ------------------------------------------------------------
@@ -452,7 +472,13 @@ def page_home(conf: Dict[str, str], me: Dict):
     users_conf = get_users(conf)
     users = [u["username"] for u in users_conf]
     counts = _get_bm_counts(users)
-    next_bm = _pick_next_bm(users, counts)
+
+    # ★ 変更：bm_log 上で確定している「次節」のBMを優先表示
+    latest_n = _get_latest_gw_number_in_bm_log()
+    bm_from_log = ""
+    if latest_n is not None:
+        bm_from_log = get_bookmaker_for_gw(f"GW{latest_n+1}")
+    next_bm = bm_from_log or _pick_next_bm(users, counts)
     players = [u for u in users if u != next_bm]
 
     st.markdown('<div class="section">次節のメンバー</div>', unsafe_allow_html=True)
@@ -1084,6 +1110,8 @@ def main():
         sync_results_and_settle(conf)
         # ★ 変更：bm_log の最新GW+1を“次節”とみなして確定
         auto_assign_bm_if_needed(conf)
+        # ★ 追加：次節BMのトースト（セッション初回のみ）
+        _toast_next_bm_once(conf, me)
         st.session_state["_synced_once"] = True
 
     tabs = st.tabs(["トップ", "試合とベット", "履歴", "リアルタイム", "ダッシュボード", "オッズ管理"])
