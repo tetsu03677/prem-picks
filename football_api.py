@@ -1,6 +1,4 @@
 # football_api.py
-from __future__ import annotations
-
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple
 
@@ -99,9 +97,3 @@ def fetch_scores_for_match_ids(conf: Dict[str, str], match_ids: List[str]) -> Di
             "away_score": live_away,
         }
     return out
-
-# ★ 追加：GW（matchday）で試合一覧を取得（fd_match_id 自動補完用）
-@st.cache_data(ttl=300)
-def fetch_matches_by_gw(conf: Dict[str, str], gw_name: str) -> Tuple[List[Dict], str]:
-    """
-    指定GW（例: 'GW7' や '7
