@@ -13,6 +13,8 @@ from google_sheets_client import (
 from football_api import (
     fetch_matches_next_gw,
     fetch_scores_for_match_ids,
+    # ★ 追加
+    fetch_matches_by_gw,
 )
 
 # ------------------------------------------------------------
@@ -133,7 +135,7 @@ def login_ui(conf: Dict[str, str]) -> Dict:
                 st.session_state.pop("_synced_once", None)
                 st.rerun()
             else:
-                st.warning("ユーザー名またはパスワードが違います。")
+                st.warning("ユーザー名またはパスワードが違います。」)
 
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -185,16 +187,56 @@ def get_bookmaker_for_gw(gw_name: str) -> str:
     return ""
 
 # ------------------------------------------------------------
-# ★★★ 追加：結果同期＋自動精算（result & bets を更新） ★★★
+# ★★★ 追加：結果同期＋自動精算（result & bets を更新）＋ fd_match_id 自動補完 ★★★
 # ------------------------------------------------------------
 def sync_results_and_settle(conf: Dict[str, str]):
-    """resultシートに確定スコアを反映し、betsを自動精算する。安全のため冪等。"""
+    """resultシートに確定スコアを反映し、betsを自動精算。odds.fd_match_id の欠落はGW単位で自動補完。"""
     try:
         # odds/bets を読み込み
         odds_rows = read_rows_by_sheet("odds") or []
         bets_rows = read_rows_by_sheet("bets") or []
 
-        # 内部ID→FD ID のマップ（odds 起点）
+        # --- (A) fd_match_id が空の行を救済：GWでAPI検索し補完 ---
+        def _norm(s: str) -> str:
+            s = (s or "").lower().strip()
+            for t in [" fc", ".", ",", "-", "  "]:
+                s = s.replace(t, " ")
+            return " ".join(s.split())
+
+        # GWごとにFDの試合一覧を引いて、home/away名で同定
+        need_fix = [r for r in odds_rows if not str(r.get("fd_match_id") or "").strip()
+                    and str(r.get("gw") or "").strip() and str(r.get("home") or "").strip() and str(r.get("away") or "").strip()]
+        gw_set = sorted({str(r.get("gw")).strip() for r in need_fix})
+        fd_lookup_by_gw = {}  # gw -> { (home_norm,away_norm) : fd_id }
+        for gw in gw_set:
+            try:
+                api_matches, _ = fetch_matches_by_gw(conf, gw)  # ← Football-Data から該当GWの全試合
+                lut = {}
+                for m in api_matches:
+                    key = (_norm(m["home"]), _norm(m["away"]))
+                    lut[key] = str(m["id"])
+                fd_lookup_by_gw[gw] = lut
+            except Exception:
+                fd_lookup_by_gw[gw] = {}
+
+        fixed_any = False
+        for r in need_fix:
+            gw = str(r.get("gw")).strip()
+            key = (_norm(r.get("home")), _norm(r.get("away")))
+            fd_id = fd_lookup_by_gw.get(gw, {}).get(key)
+            if fd_id:
+                newrow = dict(r)
+                newrow["fd_match_id"] = fd_id
+                newrow["updated_at"] = datetime.utcnow().isoformat(timespec="seconds")
+                # match_id, gw の複合キーで上書き
+                upsert_row("odds", newrow, key_cols=["match_id", "gw"])
+                fixed_any = True
+
+        if fixed_any:
+            # odds_rows を再読込（補完反映後）
+            odds_rows = read_rows_by_sheet("odds") or []
+
+        # --- (B) 内部ID→FD ID のマップ（odds 起点） ---
         in2fd = {}
         meta_by_fd = {}
         for r in odds_rows:
@@ -220,7 +262,7 @@ def sync_results_and_settle(conf: Dict[str, str]):
         # 最新スコア取得（FD ID）
         scores = fetch_scores_for_match_ids(conf, candidate_fd_ids) or {}
 
-        # 1) result を更新／追加（FINISHED or AWARDED のみ）
+        # --- (C) result を更新／追加（FINISHED or AWARDED のみ） ---
         for fd in candidate_fd_ids:
             sc = scores.get(fd) or {}
             status = (sc.get("status") or "").upper()
@@ -249,7 +291,7 @@ def sync_results_and_settle(conf: Dict[str, str]):
                 upsert_row("result", row, key_col="match_id")
                 result_by_fd[fd] = row
 
-        # 2) bets を自動精算（OPEN で result があるもの）
+        # --- (D) bets を自動精算（OPEN で result があるもの） ---
         if result_by_fd:
             for b in bets_rows:
                 if (b.get("status") or "").upper() != "OPEN":
