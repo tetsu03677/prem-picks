@@ -9,7 +9,6 @@ import streamlit as st
 BASE = "https://api.football-data.org/v4"
 
 def _headers(conf: Dict[str, str]) -> Dict[str, str]:
-    # APIトークンは config シートの "FOOTBALL_DATA_API_TOKEN"
     token = conf.get("FOOTBALL_DATA_API_TOKEN", "").strip()
     return {"X-Auth-Token": token} if token else {}
 
@@ -26,7 +25,6 @@ def _safe_get(url, headers, params):
     try:
         r = requests.get(url, headers=headers, params=params, timeout=30)
         if r.status_code == 403:
-            # レート / 403 は呼び出し側で UI アラートするため、空で返す
             return None
         r.raise_for_status()
         return r
@@ -70,7 +68,6 @@ def fetch_matches_window(day_window: int, comp: str, season: str, conf: Dict[str
 def fetch_matches_next_gw(conf: Dict[str, str], day_window: int = 7) -> Tuple[List[Dict], str]:
     comp, season = _league_and_season(conf)
     rows, gw = fetch_matches_window(day_window, comp, season, conf)
-    # GW を付与
     for r in rows:
         r["gw"] = gw
     return rows, gw
@@ -97,3 +94,40 @@ def fetch_scores_for_match_ids(conf: Dict[str, str], match_ids: List[str]) -> Di
             "away_score": live_away,
         }
     return out
+
+# ===== 追加：GW名（GW7 / 7）からその節の全試合を取得 =====
+def fetch_matches_by_gw(conf: Dict[str, str], gw_name: str) -> Tuple[List[Dict], str]:
+    """
+    指定GWの全試合を Football-Data から取得して返す。
+    app.py の救済処理（fd_match_idの自動補完）で使用。
+    """
+    # 'GW7' や '7' を数値に
+    s = str(gw_name or "").strip().upper()
+    num = "".join(ch for ch in s if ch.isdigit())
+    if not num:
+        return [], s or ""
+    matchday = int(num)
+
+    comp, season = _league_and_season(conf)
+    url = f"{BASE}/competitions/{comp}/matches"
+    params = {"matchday": matchday, "season": season}
+
+    r = _safe_get(url, _headers(conf), params)
+    if not r:
+        return [], f"GW{matchday}"
+
+    items = r.json().get("matches", []) or []
+    tzname = conf.get("timezone", "UTC")
+    rows: List[Dict] = []
+    for m in items:
+        utc = datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00"))
+        rows.append({
+            "id": m["id"],  # ← Football-Data の試合ID（= FD ID）
+            "utc_kickoff": utc,
+            "local_kickoff": _localize(utc, tzname),
+            "home": m["homeTeam"]["name"],
+            "away": m["awayTeam"]["name"],
+            "status": m.get("status", "TIMED"),
+            "gw": f"GW{m.get('matchday', matchday)}",
+        })
+    return rows, f"GW{matchday}"
