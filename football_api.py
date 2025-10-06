@@ -99,7 +99,8 @@ def fetch_scores_for_match_ids(conf: Dict[str, str], match_ids: List[str]) -> Di
 def fetch_matches_by_gw(conf: Dict[str, str], gw_name: str) -> Tuple[List[Dict], str]:
     """
     指定GWの全試合を Football-Data から取得して返す。
-    app.py の救済処理（fd_match_idの自動補完）で使用。
+    app.py の救済処理（odds.fd_match_id の自動補完）で使用。
+    season がズレている可能性に備えてフォールバック（season無し → season-1）を行う。
     """
     # 'GW7' や '7' を数値に
     s = str(gw_name or "").strip().upper()
@@ -109,17 +110,27 @@ def fetch_matches_by_gw(conf: Dict[str, str], gw_name: str) -> Tuple[List[Dict],
     matchday = int(num)
 
     comp, season = _league_and_season(conf)
-    url = f"{BASE}/competitions/{comp}/matches"
-    params = {"matchday": matchday, "season": season}
 
-    r = _safe_get(url, _headers(conf), params)
-    if not r:
-        return [], f"GW{matchday}"
+    def _fetch(season_param):
+        url = f"{BASE}/competitions/{comp}/matches"
+        params = {"matchday": matchday}
+        if season_param is not None:
+            params["season"] = season_param
+        r = _safe_get(url, _headers(conf), params)
+        return r.json().get("matches", []) if r else []
 
-    items = r.json().get("matches", []) or []
+    # 1) conf の season で試行
+    items = _fetch(season)
+    # 2) ダメなら season 指定なし
+    if not items:
+        items = _fetch(None)
+    # 3) それでもダメなら season-1
+    if not items and season and str(season).isdigit():
+        items = _fetch(str(int(season) - 1))
+
     tzname = conf.get("timezone", "UTC")
     rows: List[Dict] = []
-    for m in items:
+    for m in items or []:
         utc = datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00"))
         rows.append({
             "id": m["id"],  # ← Football-Data の試合ID（= FD ID）
