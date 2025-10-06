@@ -559,44 +559,32 @@ def page_history(conf: Dict[str, str], me: Dict):
         st.info("履歴はまだありません。")
         return
 
-    # ▼▼▼ 変更：セレクトをフォーム化して送信時のみ再実行（タブ遷移を抑止）
+    # 1) 既存のGWセレクトは維持
+    gw_vals = {(b.get("gw") if b.get("gw") not in (None, "") else "") for b in bets}
+    gw_set = sorted(gw_vals, key=_gw_sort_key)
+    sel_gw = st.selectbox("表示するGW", gw_set, index=0 if gw_set else None, key="hist_gw")
+
+    # 2) 追加：ユーザー切替（既定=自分、必要なら他人も）
     all_users = sorted({b.get("user") for b in bets if b.get("user")})
     my_name = me.get("username")
     admin_only = str(conf.get("admin_only_view_others", "false")).lower() == "true"
     can_view_others = (me.get("role") == "admin") or (not admin_only)
+
+    # セレクタの候補（自分＋許可されている場合のみ他人）
     opts = [my_name] + [u for u in all_users if u != my_name and can_view_others]
-
-    gw_vals = {(b.get("gw") if b.get("gw") not in (None, "") else "") for b in bets}
-    gw_set = sorted(gw_vals, key=_gw_sort_key)
-
-    # 直近の選択状態（なければデフォルト）
-    cur_gw = st.session_state.get("hist_gw_val", (gw_set[0] if gw_set else ""))
-    if cur_gw not in gw_set and gw_set:
-        cur_gw = gw_set[0]
-    cur_user = st.session_state.get("hist_user_val", my_name)
-    if cur_user not in opts:
-        cur_user = my_name
-
-    with st.form("hist_filter_form", clear_on_submit=False):
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            sel_gw_idx = (gw_set.index(cur_gw) if gw_set and cur_gw in gw_set else 0)
-            sel_gw = st.selectbox("表示するGW", gw_set, index=sel_gw_idx, key="hist_gw_select")
-        with c2:
-            sel_user_idx = (opts.index(cur_user) if cur_user in opts else 0)
-            sel_user = st.selectbox("ユーザー", opts, index=sel_user_idx, key="hist_user_select",
-                                    help="既定は自分。他ユーザーはプレビュー表示（編集はできません）。")
-        submitted = st.form_submit_button("表示更新", use_container_width=True)
-
-    # 送信時のみ現在値を更新（選択操作だけでは再計算しない）
-    if submitted:
-        st.session_state["hist_gw_val"] = sel_gw
-        st.session_state["hist_user_val"] = sel_user
-
-    # 有効値（未送信のときは前回のまま）
-    sel_gw = st.session_state.get("hist_gw_val", cur_gw)
-    sel_user = st.session_state.get("hist_user_val", cur_user)
-    # ▲▲▲ ここまで
+    # ラベルをわかりやすく（自分にはマーク）
+    label_map = {u: (f"{u}（自分）" if u == my_name else u) for u in opts}
+    # 表示はラベルだが、内部はユーザー名で扱う
+    sel_label = st.selectbox(
+        "ユーザー",
+        [label_map[u] for u in opts],
+        index=0,
+        key="hist_user",
+        help="既定は自分。他ユーザーはプレビュー表示（編集はできません）。"
+    )
+    # 逆引き
+    inv_label = {v: k for k, v in label_map.items()}
+    sel_user = inv_label.get(sel_label, my_name)
 
     # 3) 絞り込み：選択GW × 選択ユーザー
     target = [b for b in bets if (b.get("gw") == sel_gw and b.get("user") == sel_user)]
@@ -605,7 +593,7 @@ def page_history(conf: Dict[str, str], me: Dict):
         return
 
     # 4) KPI（選択ユーザーで再計算）
-    total_stake = sum(parse_int(b.get("stake", 0)) for b in target if (b.get("result") in ["WIN","LOSE"]))
+    total_stake = sum(parse_int(b.get("stake", 0)) for b in target)
     total_payout = sum(parse_float(b.get("payout"), 0.0) or 0.0 for b in target if (b.get("result") in ["WIN","LOSE"]))
     total_net = total_payout - total_stake
     badge = "（閲覧）" if sel_user != my_name else ""
@@ -625,9 +613,9 @@ def page_history(conf: Dict[str, str], me: Dict):
         # 各ユーザーの確定net（未確定は0扱い）
         user_net = {}
         for u in {b.get("user") for b in gw_all if b.get("user")}:
-            ub = [b for b in gw_all if b.get("user") == u and (b.get("result") in ["WIN","LOSE"])]
-            stake_sum = sum(parse_int(x.get("stake", 0)) for x in ub)
-            payout_sum = sum(parse_float(x.get("payout"), 0.0) or 0.0 for x in ub)
+            ub = [b for b in gw_all if b.get("user") == u]
+            stake_sum = sum(parse_int(x.get("stake", 0)) for x in ub if (x.get("result") in ["WIN","LOSE"]))
+            payout_sum = sum(parse_float(x.get("payout"), 0.0) or 0.0 for x in ub if (x.get("result") in ["WIN","LOSE"]))
             user_net[u] = payout_sum - stake_sum
         others_net_sum = sum(v for k, v in user_net.items() if k != current_bm)
         bm_net = -others_net_sum
@@ -654,20 +642,18 @@ def page_history(conf: Dict[str, str], me: Dict):
         pick = (b.get("pick") or "").upper()
         if pick == "HOME":
             pred_team = b.get("match", "")
-            pred_str = f"{pred_team} Win"
         elif pick == "AWAY":
             pred_team = away_lut.get((b.get("gw"), str(b.get("match_id"))), "AWAY")
-            pred_str = f"{pred_team} Win"
         else:
-            pred_str = "Draw"
+            pred_team = "Draw"
 
         if result in ["WIN", "LOSE"]:
             payout = parse_float(b.get("payout"), stake * odds if result == "WIN" else 0.0) or 0.0
             net = payout - stake
             res_tag = "Hit!!" if result == "WIN" else "Miss"
-            st.markdown(f"・{b.get('user','')}｜[Pred] {pred_str}｜[Res] {res_tag}｜{stake} at {odds:.2f}→{payout:.2f}（net {net:.2f}）")
+            st.markdown(f"・{b.get('user','')}｜[Pred] {pred_team}｜[Res] {res_tag}｜{stake} at {odds:.2f}→{payout:.2f}（net {net:.2f}）")
         else:
-            st.markdown(f"・{b.get('user','')}｜[Pred] {pred_str}｜[Res] -｜{stake} at {odds:.2f}→-（net -）")
+            st.markdown(f"・{b.get('user','')}｜[Pred] {pred_team}｜[Res] -｜{stake} at {odds:.2f}→-（net -）")
 
     for b in target:
         row_view(b)
@@ -839,46 +825,23 @@ def page_dashboard(conf: Dict[str, str], me: Dict):
         return
 
     my_name = me.get("username")
-
-    # ▼▼▼ 変更：集計対象は確定済のみ＋BM補正を加味
-    settled = [b for b in bets if (b.get("result") in ["WIN", "LOSE"])]
-
-    # 自分のベット（確定済）
-    my_bets = [b for b in settled if b.get("user") == my_name]
+    my_bets = [b for b in bets if b.get("user") == my_name]
 
     total_stake = sum(parse_int(b.get("stake", 0)) for b in my_bets)
-    total_payout = sum((parse_float(b.get("payout"), 0.0) or 0.0) for b in my_bets)
-    base_net = total_payout - total_stake
-
-    # BM補正（自分がBMのGWについて、他全員の確定net合計のマイナスを加算）
-    gw_list = sorted({b.get("gw") for b in settled if b.get("gw")})
-    bm_adjust = 0.0
-    for gw in gw_list:
-        bm = get_bookmaker_for_gw(gw)
-        if bm != my_name:
-            continue
-        gw_rows = [b for b in settled if b.get("gw") == gw]
-        others = [b for b in gw_rows if b.get("user") != my_name]
-        others_stake = sum(parse_int(b.get("stake", 0)) for b in others)
-        others_payout = sum((parse_float(b.get("payout"), 0.0) or 0.0) for b in others)
-        others_net = others_payout - others_stake
-        bm_adjust += (-others_net)
-
-    total_net = base_net + bm_adjust
-    # ▲▲▲ ここまで
+    total_payout = sum((parse_float(b.get("payout"), 0.0) or 0.0)
+                       for b in my_bets if (b.get("result") in ["WIN", "LOSE"]))
+    total_net = total_payout - total_stake
 
     st.markdown(
         f"""
         <div class="kpi-row">
-          <div class="kpi"><div class="h">トータル収支（{my_name}／BM補正込み）</div><div class="v">{total_net:,.2f}</div></div>
+          <div class="kpi"><div class="h">トータル収支（{my_name}）</div><div class="v">{total_net:,.2f}</div></div>
           <div class="kpi"><div class="h">総支出額（stake）</div><div class="v">{total_stake:,}</div></div>
           <div class="kpi"><div class="h">トータル収入額（payout）</div><div class="v">{total_payout:,.2f}</div></div>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    if abs(bm_adjust) > 0.0001:
-        st.caption(f"　※BM補正 合計：{bm_adjust:,.2f}")
 
     users = sorted(list({b.get("user") for b in bets if b.get("user")}))
     others = [u for u in users if u != my_name]
@@ -886,23 +849,11 @@ def page_dashboard(conf: Dict[str, str], me: Dict):
         st.markdown('<div class="section">他ユーザー（参考）</div>', unsafe_allow_html=True)
         cols = st.columns(max(2, min(4, len(others))))
         for i, u in enumerate(others):
-            ub = [b for b in settled if b.get("user") == u]
+            ub = [b for b in bets if b.get("user") == u]
             ustake = sum(parse_int(b.get("stake", 0)) for b in ub)
-            upayout = sum((parse_float(b.get("payout"), 0.0) or 0.0) for b in ub)
-            unat_base = upayout - ustake
-            # 参考表示側もBM補正を加味（見栄えのみ）
-            bm_adj = 0.0
-            for gw in gw_list:
-                bm_u = get_bookmaker_for_gw(gw)
-                if bm_u != u:
-                    continue
-                gw_rows = [b for b in settled if b.get("gw") == gw]
-                others_rows = [b for b in gw_rows if b.get("user") != u]
-                s = sum(parse_int(b.get("stake", 0)) for b in others_rows)
-                p = sum((parse_float(b.get("payout"), 0.0) or 0.0) for b in others_rows)
-                bm_adj += (-(p - s))
-            unat = unat_base + bm_adj
-
+            upayout = sum((parse_float(b.get("payout"), 0.0) or 0.0)
+                          for b in ub if (b.get("result") in ["WIN", "LOSE"]))
+            unat = upayout - ustake
             with cols[i % len(cols)]:
                 st.markdown(
                     f'<div class="kpi"><div class="h">{u}</div>'
@@ -942,4 +893,100 @@ def page_dashboard(conf: Dict[str, str], me: Dict):
     if not stats:
         st.caption("　対象データ不足（3ベット未満）")
     else:
-        stats.sort(key=lambda x: (-x[1], -
+        stats.sort(key=lambda x: (-x[1], -x[3]))
+        for t, acc, n, net in stats[:3]:
+            st.caption(f"　- {t}: 的中率 {acc*100:.1f}%（{n}件）／ 累計net {net:,.2f}")
+
+# ------------------------------------------------------------
+# UI: オッズ管理（既存維持）
+# ------------------------------------------------------------
+def page_odds_admin(conf: Dict[str, str], me: Dict):
+    st.markdown("## オッズ管理")
+    is_admin = (me.get("role") == "admin")
+    if not is_admin:
+        st.info("閲覧のみ（管理者のみ編集可能）")
+
+    matches_raw, gw = fetch_matches_next_gw(conf, day_window=7)
+    if not matches_raw:
+        st.info("対象の試合が見つかりません。")
+        return
+
+    odds_rows = read_rows_by_sheet("odds")
+    odds_by_match = {str(r.get("match_id")): r for r in odds_rows if r.get("match_id")}
+
+    for m in matches_raw:
+        mid = str(m["id"])
+        od = odds_by_match.get(mid, {})
+        with st.container(border=True):
+            st.markdown(f"**{m['home']} vs {m['away']}**　（{gw}）")
+
+            with st.form(f"odds_form_{mid}", clear_on_submit=False):
+                c1, c2, c3, c4, c5 = st.columns([1,1,1,0.9,1.2])
+                with c1:
+                    home = st.number_input("Home", min_value=1.01, step=0.1,
+                                           value=parse_float(od.get("home_win"), 1.01),
+                                           key=f"od_h_{mid}", disabled=not is_admin)
+                with c2:
+                    draw = st.number_input("Draw", min_value=1.01, step=0.1,
+                                           value=parse_float(od.get("draw"), 1.01),
+                                           key=f"od_d_{mid}", disabled=not is_admin)
+                with c3:
+                    away = st.number_input("Away", min_value=1.01, step=0.1,
+                                           value=parse_float(od.get("away_win"), 1.01),
+                                           key=f"od_a_{mid}", disabled=not is_admin)
+                with c4:
+                    confirm = st.checkbox("オッズを確定（公開）", value=(str(od.get("locked","")).upper()=="YES"),
+                                          key=f"od_locked_{mid}", disabled=not is_admin)
+                with c5:
+                    submitted = st.form_submit_button("保存", disabled=not is_admin, use_container_width=True)
+
+                if submitted and is_admin:
+                    if home <= 1.0 or draw <= 1.0 or away <= 1.0:
+                        st.warning("3つのオッズはすべて 1.01 以上で入力してください。")
+                    else:
+                        row = {
+                            "gw": gw,
+                            "match_id": mid,
+                            "home": m["home"],
+                            "away": m["away"],
+                            "home_win": str(home),
+                            "draw": str(draw),
+                            "away_win": str(away),
+                            "locked": "YES" if confirm else "",
+                            "updated_at": datetime.utcnow().isoformat(timespec="seconds"),
+                        }
+                        upsert_row("odds", row, key_cols=["match_id", "gw"])
+                        st.success("保存しました。")
+
+# ------------------------------------------------------------
+# メイン
+# ------------------------------------------------------------
+def main():
+    conf = get_conf()
+
+    me = login_ui(conf)
+    if not me:
+        st.stop()
+
+    # ★ ログイン後に一度だけ同期（result更新＆bets精算）
+    if not st.session_state.get("_synced_once"):
+        sync_results_and_settle(conf)
+        st.session_state["_synced_once"] = True
+
+    tabs = st.tabs(["トップ", "試合とベット", "履歴", "リアルタイム", "ダッシュボード", "オッズ管理"])
+
+    with tabs[0]:
+        page_home(conf, me)
+    with tabs[1]:
+        page_matches_and_bets(conf, me)
+    with tabs[2]:
+        page_history(conf, me)
+    with tabs[3]:
+        page_realtime(conf, me)
+    with tabs[4]:
+        page_dashboard(conf, me)
+    with tabs[5]:
+        page_odds_admin(conf, me)
+
+if __name__ == "__main__":
+    main()
