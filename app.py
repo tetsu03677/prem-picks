@@ -4,6 +4,7 @@ from typing import Dict, List, Tuple
 
 import pytz
 import streamlit as st
+import time  # ★ 追加
 
 from google_sheets_client import (
     read_config_map,
@@ -274,6 +275,26 @@ def auto_assign_bm_if_needed(conf: Dict[str, str]):
         upsert_row("bm_log", row, key_cols=["gw", "gw_number"])
     except Exception:
         # 自動確定失敗はUIに影響しないよう握りつぶし
+        pass
+
+# ★ 追加：初回ログイン時に「次節BMお知らせ」を10秒だけ表示（端末内1回）
+def show_bm_notice_if_needed(conf: Dict[str, str], me: Dict):
+    try:
+        _, gw = fetch_matches_next_gw(conf, day_window=30)  # 試合が離れていても拾う
+        if not gw:
+            return
+        bm = get_bookmaker_for_gw(gw)
+        if not bm:
+            return
+        key = f"_bm_notice_seen:{gw}:{me.get('username')}"
+        if st.session_state.get(key):
+            return
+        placeholder = st.empty()
+        placeholder.info(f"次節のBMは {bm} です。{bm} 以外のメンバーは『試合とベット』よりベッティングを行ってください。", icon="🔔")
+        time.sleep(10)
+        placeholder.empty()
+        st.session_state[key] = True
+    except Exception:
         pass
 
 # ------------------------------------------------------------
@@ -1059,6 +1080,9 @@ def main():
         # ★ 追加：前節が確定していれば次節BMを自動確定し bm_log に追記
         auto_assign_bm_if_needed(conf)
         st.session_state["_synced_once"] = True
+
+    # ★ 追加：BM確定済みなら初回だけ10秒通知
+    show_bm_notice_if_needed(conf, me)
 
     tabs = st.tabs(["トップ", "試合とベット", "履歴", "リアルタイム", "ダッシュボード", "オッズ管理"])
 
