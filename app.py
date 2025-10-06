@@ -606,18 +606,54 @@ def page_history(conf: Dict[str, str], me: Dict):
     """
     st.markdown(kpi_html, unsafe_allow_html=True)
 
-    # 5) 明細（そのユーザーのみ）
+    # --- 追加：このGWのBM損益を表示 ---
+    current_bm = get_bookmaker_for_gw(sel_gw)
+    if current_bm:
+        gw_all = [b for b in bets if b.get("gw") == sel_gw]
+        # 各ユーザーの確定net（未確定は0扱い）
+        user_net = {}
+        for u in {b.get("user") for b in gw_all if b.get("user")}:
+            ub = [b for b in gw_all if b.get("user") == u]
+            stake_sum = sum(parse_int(x.get("stake", 0)) for x in ub if (x.get("result") in ["WIN","LOSE"]))
+            payout_sum = sum(parse_float(x.get("payout"), 0.0) or 0.0 for x in ub if (x.get("result") in ["WIN","LOSE"]))
+            user_net[u] = payout_sum - stake_sum
+        others_net_sum = sum(v for k, v in user_net.items() if k != current_bm)
+        bm_net = -others_net_sum
+        st.markdown(
+            f'<div class="kpi-row"><div class="kpi"><div class="h">このGWのBM損益（{current_bm}）</div><div class="v">{bm_net:,.2f}</div></div></div>',
+            unsafe_allow_html=True
+        )
+
+    # 5) 明細（そのユーザーのみ）— ご指定フォーマットに変更（[Pred]/[Res]）
+    odds_rows = read_rows_by_sheet("odds") or []
+    # GW + match_id → away名
+    away_lut = {}
+    for r in odds_rows:
+        gw = str(r.get("gw") or "")
+        mid = str(r.get("match_id") or "")
+        away_lut[(gw, mid)] = r.get("away", "")
+
     def row_view(b):
         stake = parse_int(b.get("stake", 0))
         odds = parse_float(b.get("odds"), 1.0) or 1.0
         result = (b.get("result") or "").upper()
-        if result in ["WIN", "LOSE"]:
-            payout = parse_float(b.get("payout"), stake * odds if result == "WIN" else 0.0)
-            net = payout - stake
-            tail = f"｜結果：{result} ｜ payout {payout:.2f} ｜ net {net:.2f}"
+
+        # [Pred] 勝利チーム名（DRAWは"Draw"）
+        pick = (b.get("pick") or "").upper()
+        if pick == "HOME":
+            pred_team = b.get("match", "")
+        elif pick == "AWAY":
+            pred_team = away_lut.get((b.get("gw"), str(b.get("match_id"))), "AWAY")
         else:
-            tail = "｜結果：- ｜ payout - ｜ net -"
-        st.markdown(f"- **{b.get('user','')}**：{b.get('match','')} → {b.get('pick','')} / {stake} at {odds} {tail}")
+            pred_team = "Draw"
+
+        if result in ["WIN", "LOSE"]:
+            payout = parse_float(b.get("payout"), stake * odds if result == "WIN" else 0.0) or 0.0
+            net = payout - stake
+            res_tag = "Hit!!" if result == "WIN" else "Miss"
+            st.markdown(f"・{b.get('user','')}｜[Pred] {pred_team}｜[Res] {res_tag}｜{stake} at {odds:.2f}→{payout:.2f}（net {net:.2f}）")
+        else:
+            st.markdown(f"・{b.get('user','')}｜[Pred] {pred_team}｜[Res] -｜{stake} at {odds:.2f}→-（net -）")
 
     for b in target:
         row_view(b)
@@ -774,8 +810,8 @@ def page_realtime(conf: Dict[str, str], me: Dict):
             cp = current_payout(b)
             st.caption(f"- {b.get('user')}：{b.get('pick')} / {b.get('stake')} at {b.get('odds')} → 時点 {cp:,.2f}")
 
-    if st.button("スコアを更新", use_container_width=True):
-        st.rerun()
+    # ▼変更：st.rerun() を削除（押下＝再実行で十分／タブ遷移抑止）
+    st.button("スコアを更新", use_container_width=True)
 
 # ------------------------------------------------------------
 # UI: ダッシュボード（既存維持）
