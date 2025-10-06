@@ -90,7 +90,6 @@ def fetch_scores_for_match_ids(conf: Dict[str, str], match_ids: List[str]) -> Di
         full = score.get("fullTime", {}) or {}
         live_home = full.get("home", 0)
         live_away = full.get("away", 0)
-        # 試合詳細により bestEffort で live を拾う（fullTime が 0-0 の途中は minute 別は取れないため）
         status = j.get("status", "TIMED")
         out[str(mid)] = {
             "status": status,
@@ -100,3 +99,9 @@ def fetch_scores_for_match_ids(conf: Dict[str, str], match_ids: List[str]) -> Di
             "away_score": live_away,
         }
     return out
+
+# ★ 追加：GW（matchday）で試合一覧を取得（fd_match_id 自動補完用）
+@st.cache_data(ttl=300)
+def fetch_matches_by_gw(conf: Dict[str, str], gw_name: str) -> Tuple[List[Dict], str]:
+    """
+    指定GW（例: 'GW7' や '7
