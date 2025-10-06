@@ -78,29 +78,58 @@ def fetch_matches_next_gw(conf: Dict[str, str], day_window: int = 7) -> Tuple[Li
     return rows, gw
 
 def fetch_scores_for_match_ids(conf: Dict[str, str], match_ids: List[str]) -> Dict[str, Dict]:
-    """指定 match_id 群のスコア（LIVE/FINISHED含む）。403 等は空 dict を返す。"""
-    out = {}
-    # 受け取ったIDをすべて正規化してから問い合わせ
-    ids = [ _norm_id(mid) for mid in (match_ids or []) ]
-    ids = [ mid for mid in ids if mid ]
-    for mid in ids:
-        url = f"{BASE}/matches/{mid}"
-        r = _safe_get(url, _headers(conf), params={})
-        if not r:
-            continue
-        j = r.json().get("match", {})
-        score = j.get("score", {})
-        full = score.get("fullTime", {}) or {}
-        live_home = full.get("home", 0)
-        live_away = full.get("away", 0)
-        status = j.get("status", "TIMED")
-        out[mid] = {
-            "status": status,
-            "home": j.get("homeTeam", {}).get("name", ""),
-            "away": j.get("awayTeam", {}).get("name", ""),
-            "home_score": live_home,
-            "away_score": live_away,
+    """
+    指定 match_id 群のスコア（LIVE/FINISHED含む）。
+    1) まず /matches?ids=... で一括取得（成功率が高い）
+    2) 取りこぼし分だけ /matches/{id} で個別再試行
+    403 などは静かにスキップし、可能な範囲で返す。
+    """
+    out: Dict[str, Dict] = {}
+    ids = [_norm_id(mid) for mid in (match_ids or [])]
+    ids = [mid for mid in ids if mid]
+    if not ids:
+        return out
+
+    def _put(m):
+        score = (m.get("score") or {})
+        full = (score.get("fullTime") or {})
+        out[_norm_id(m.get("id"))] = {
+            "status": m.get("status", "TIMED"),
+            "home": (m.get("homeTeam") or {}).get("name", ""),
+            "away": (m.get("awayTeam") or {}).get("name", ""),
+            "home_score": full.get("home", 0) or 0,
+            "away_score": full.get("away", 0) or 0,
         }
+
+    # --- (A) 一括取得（/matches?ids=...） ---
+    try:
+        url = f"{BASE}/matches"
+        # API 仕様上 ids はカンマ区切り（長い場合は数十件ずつに分割）
+        chunk = 20
+        for i in range(0, len(ids), chunk):
+            batch = ids[i:i+chunk]
+            r = _safe_get(url, _headers(conf), params={"ids": ",".join(batch)})
+            if not r:
+                continue
+            matches = (r.json() or {}).get("matches", []) or []
+            for m in matches:
+                _put(m)
+    except Exception:
+        pass
+
+    # --- (B) 取りこぼし分を個別取得（/matches/{id}） ---
+    missing = [mid for mid in ids if mid not in out]
+    for mid in missing:
+        try:
+            r = _safe_get(f"{BASE}/matches/{mid}", _headers(conf), params={})
+            if not r:
+                continue
+            m = (r.json() or {}).get("match", {}) or {}
+            if m:
+                _put(m)
+        except Exception:
+            continue
+
     return out
 
 # ===== 追加：GW名（GW7 / 7）からその節の全試合を取得 =====
