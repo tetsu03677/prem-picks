@@ -31,6 +31,11 @@ def _safe_get(url, headers, params):
     except Exception:
         return None
 
+# ---- 追加：ID正規化（数字だけを抜き出して文字列化） ----
+def _norm_id(x) -> str:
+    s = "".join(ch for ch in str(x or "").strip() if ch.isdigit())
+    return s or str(x or "").strip()
+
 def fetch_matches_window(day_window: int, comp: str, season: str, conf: Dict[str, str]) -> Tuple[List[Dict], str]:
     """今日から day_window 日の試合（EPL のみ）"""
     today_utc = datetime.now(timezone.utc)
@@ -54,7 +59,7 @@ def fetch_matches_window(day_window: int, comp: str, season: str, conf: Dict[str
     for m in items:
         utc = datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00"))
         rows.append({
-            "id": m["id"],
+            "id": _norm_id(m["id"]),
             "utc_kickoff": utc,
             "local_kickoff": _localize(utc, tzname),
             "home": m["homeTeam"]["name"],
@@ -75,7 +80,10 @@ def fetch_matches_next_gw(conf: Dict[str, str], day_window: int = 7) -> Tuple[Li
 def fetch_scores_for_match_ids(conf: Dict[str, str], match_ids: List[str]) -> Dict[str, Dict]:
     """指定 match_id 群のスコア（LIVE/FINISHED含む）。403 等は空 dict を返す。"""
     out = {}
-    for mid in match_ids:
+    # 受け取ったIDをすべて正規化してから問い合わせ
+    ids = [ _norm_id(mid) for mid in (match_ids or []) ]
+    ids = [ mid for mid in ids if mid ]
+    for mid in ids:
         url = f"{BASE}/matches/{mid}"
         r = _safe_get(url, _headers(conf), params={})
         if not r:
@@ -86,7 +94,7 @@ def fetch_scores_for_match_ids(conf: Dict[str, str], match_ids: List[str]) -> Di
         live_home = full.get("home", 0)
         live_away = full.get("away", 0)
         status = j.get("status", "TIMED")
-        out[str(mid)] = {
+        out[mid] = {
             "status": status,
             "home": j.get("homeTeam", {}).get("name", ""),
             "away": j.get("awayTeam", {}).get("name", ""),
@@ -133,7 +141,7 @@ def fetch_matches_by_gw(conf: Dict[str, str], gw_name: str) -> Tuple[List[Dict],
     for m in items or []:
         utc = datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00"))
         rows.append({
-            "id": m["id"],  # ← Football-Data の試合ID（= FD ID）
+            "id": _norm_id(m["id"]),  # ← 正規化
             "utc_kickoff": utc,
             "local_kickoff": _localize(utc, tzname),
             "home": m["homeTeam"]["name"],
