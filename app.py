@@ -262,6 +262,37 @@ def _is_gw_finished(conf: Dict[str, str], gw_label: str) -> bool:
     except Exception:
         return False
 
+def get_active_gw_label(conf: Dict[str, str]) -> str:
+    """
+    bm_log を起点に「現在アクティブなGW（表示や権限制御で使うGW）」を返す。
+    - 最新GWが全試合終了していれば → GW{最新+1}
+    - 終了していなければ → GW{最新}
+    - bm_logが空 or 異常時は conf.current_gw をフォールバック
+    """
+    try:
+        gw_max = parse_int(conf.get("gw_max", 38), 38)
+        latest_n = _get_latest_gw_number_in_bm_log()
+        if latest_n is None:
+            return conf.get("current_gw", "").strip()
+
+        prev_label = f"GW{latest_n}"
+        next_label = f"GW{latest_n + 1}"
+
+        # 最終節ガード：最新が最終節以上なら“次”は存在しないので最新を返す
+        if latest_n >= gw_max:
+            return prev_label
+
+        # 最新が終わっていたら → 次節を“現在アクティブ”として扱う
+        if _is_gw_finished(conf, prev_label):
+            return next_label
+
+        # まだ終わっていなければ → 最新を“現在アクティブ”として扱う
+        return prev_label
+    except Exception:
+        # フォールバック
+        return conf.get("current_gw", "").strip()
+
+
 # ★ 変更：bm_log の「最新GW+1」を“次節”として自動確定して追記（より厳密）
 def auto_assign_bm_if_needed(conf: Dict[str, str]):
     try:
@@ -522,7 +553,7 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
     st.markdown("## 試合とベット")
 
     matches_raw, gw = fetch_matches_next_gw(conf, day_window=7)
-    gw_name, _, _ = gw_and_lock_state(conf, matches_raw)  # 参照のみ（全体ロックは使わない）
+    gw_name = get_active_gw_label(conf)  # ← 追加関数で“アクティブGW”を決定
 
     # ===== 追加：BMはこのページでベット禁止 =====
     current_bm = get_bookmaker_for_gw(gw_name)
