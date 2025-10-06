@@ -93,6 +93,35 @@ def norm_id(x) -> str:
     s = "".join(ch for ch in str(x or "").strip() if ch.isdigit())
     return s or str(x or "").strip()
 
+# ★ 追加：GW番号の安全抽出（"GW7"/"7"→7、失敗時はNone）
+def _parse_gw_number(gw_name: str):
+    try:
+        digits = "".join(ch for ch in str(gw_name or "") if ch.isdigit())
+        return int(digits) if digits else None
+    except Exception:
+        return None
+
+# ★ 追加：与えたGW表記（"GW7"や"7"）でマッチ取得（両表記を順番に試す）
+def _fetch_matches_by_gw_any(conf: Dict[str, str], gw_label: str) -> List[Dict]:
+    variants = []
+    n = _parse_gw_number(gw_label)
+    if gw_label:
+        variants.append(str(gw_label))
+    if n is not None:
+        variants.extend([f"GW{n}", str(n)])
+    seen = []
+    for v in variants:
+        if v in seen:
+            continue
+        seen.append(v)
+        try:
+            ms, _ = fetch_matches_by_gw(conf, v)
+            if ms:
+                return ms
+        except Exception:
+            pass
+    return []
+
 # ------------------------------------------------------------
 # 設定読込
 # ------------------------------------------------------------
@@ -167,7 +196,8 @@ def _get_bm_counts(users: List[str]) -> Dict[str, int]:
     try:
         rows = read_rows_by_sheet("bm_log") or []
         for r in rows:
-            u = str(r.get("user", "")).strip()
+            # ★ 変更：bookmaker 列にも対応
+            u = str(r.get("bookmaker") or r.get("user") or "").strip()
             if u in counts:
                 counts[u] += 1
     except Exception:
@@ -190,6 +220,61 @@ def get_bookmaker_for_gw(gw_name: str) -> str:
             # 列名の揺れに対応（bookmaker or user）
             return str(r.get("bookmaker") or r.get("user") or "").strip()
     return ""
+
+# ★ 追加：前節が全試合確定かを判定
+def _is_gw_finished(conf: Dict[str, str], gw_label: str) -> bool:
+    try:
+        matches = _fetch_matches_by_gw_any(conf, gw_label)
+        if not matches:
+            return False
+        ids = [norm_id(m.get("id")) for m in matches if m.get("id")]
+        if not ids:
+            return False
+        scores = fetch_scores_for_match_ids(conf, ids) or {}
+        def _done(s):
+            stt = (s.get("status") or "").upper()
+            return stt in ("FINISHED", "AWARDED")
+        for mid in ids:
+            sc = scores.get(mid) or {}
+            if not _done(sc):
+                return False
+        return True
+    except Exception:
+        return False
+
+# ★ 追加：必要なら次節BMを自動確定して bm_log に1行追記
+def auto_assign_bm_if_needed(conf: Dict[str, str]):
+    try:
+        matches_next, next_gw = fetch_matches_next_gw(conf, day_window=7)
+        if not next_gw:
+            return
+        # すでに次節のBMが確定済みなら何もしない
+        if get_bookmaker_for_gw(next_gw):
+            return
+        n = _parse_gw_number(next_gw)
+        if not n or n <= 1:
+            return
+        prev_label = f"GW{n-1}"
+        if not _is_gw_finished(conf, prev_label):
+            return  # 前節が未確定
+        # ユーザーの並び順と既存回数から次BMを選出
+        users_conf = get_users(conf)
+        users = [u["username"] for u in users_conf]
+        counts = _get_bm_counts(users)
+        next_bm = _pick_next_bm(users, counts)
+        if not next_bm:
+            return
+        row = {
+            "gw": f"GW{n}",
+            "gw_number": str(n),
+            "bookmaker": next_bm,
+            "decided_at": datetime.utcnow().isoformat(timespec="seconds"),
+        }
+        # 冪等: gw, gw_number をキーとしてUpsert
+        upsert_row("bm_log", row, key_cols=["gw", "gw_number"])
+    except Exception:
+        # 自動確定失敗はUIに影響しないよう握りつぶし
+        pass
 
 # ------------------------------------------------------------
 # ★★★ 追加：結果同期＋自動精算（result & bets を更新）＋ fd_match_id 自動補完 ★★★
@@ -971,6 +1056,8 @@ def main():
     # ★ ログイン後に一度だけ同期（result更新＆bets精算）
     if not st.session_state.get("_synced_once"):
         sync_results_and_settle(conf)
+        # ★ 追加：前節が確定していれば次節BMを自動確定し bm_log に追記
+        auto_assign_bm_if_needed(conf)
         st.session_state["_synced_once"] = True
 
     tabs = st.tabs(["トップ", "試合とベット", "履歴", "リアルタイム", "ダッシュボード", "オッズ管理"])
