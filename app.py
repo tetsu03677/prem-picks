@@ -176,12 +176,13 @@ def get_users(conf: Dict[str, str]) -> List[Dict]:
 
 # ------------------------------------------------------------
 # 右上：データ更新ボタン（景観控えめ）
+#   ※ 重複キー回避のため page_id を必須に
 # ------------------------------------------------------------
-def render_refresh_bar():
+def render_refresh_bar(page_id: str):
     st.markdown('<div class="util-bar"></div>', unsafe_allow_html=True)
     cols = st.columns([1, 0.17])
     with cols[-1]:
-        if st.button("データ更新", key="btn_data_refresh", use_container_width=True):
+        if st.button("データ更新", key=f"btn_data_refresh_{page_id}", use_container_width=True):
             # 世代を進めてキャッシュ全クリア → 同じタブのまま再実行
             st.session_state["_data_rev"] = _data_rev() + 1
             st.cache_data.clear()
@@ -524,7 +525,7 @@ def sync_results_and_settle(conf: Dict[str, str]):
 # UI: トップ（BM表示＋カウンタ）
 # ------------------------------------------------------------
 def page_home(conf: Dict[str, str], me: Dict):
-    render_refresh_bar()
+    render_refresh_bar("home")
     st.markdown("## トップ")
     st.info("ここでは簡単なガイドだけを表示。実際の操作は上部タブから。")
     if me:
@@ -567,7 +568,7 @@ def page_home(conf: Dict[str, str], me: Dict):
 # UI: 試合とベット（GW基準＝get_active_gw_label）
 # ------------------------------------------------------------
 def page_matches_and_bets(conf: Dict[str, str], me: Dict):
-    render_refresh_bar()
+    render_refresh_bar("bets")
     st.markdown("## 試合とベット")
 
     gw_name = get_active_gw_label(conf)
@@ -756,7 +757,7 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
 # UI: 履歴（ユーザー切替あり）
 # ------------------------------------------------------------
 def page_history(conf: Dict[str, str], me: Dict):
-    render_refresh_bar()
+    render_refresh_bar("history")
     st.markdown("## 履歴")
 
     bets = rows("bets")
@@ -838,7 +839,7 @@ def page_history(conf: Dict[str, str], me: Dict):
 # UI: リアルタイム（GW基準＝get_active_gw_label）
 # ------------------------------------------------------------
 def page_realtime(conf: Dict[str, str], me: Dict):
-    render_refresh_bar()
+    render_refresh_bar("realtime")
     st.markdown("## リアルタイム")
     st.caption("更新ボタンで最新スコアを手動取得。自動更新はしません。")
 
@@ -993,7 +994,7 @@ def page_realtime(conf: Dict[str, str], me: Dict):
 # UI: ダッシュボード
 # ------------------------------------------------------------
 def page_dashboard(conf: Dict[str, str], me: Dict):
-    render_refresh_bar()
+    render_refresh_bar("dashboard")
     st.markdown("## ダッシュボード")
 
     bets = rows("bets")
@@ -1078,7 +1079,7 @@ def page_dashboard(conf: Dict[str, str], me: Dict):
 # UI: オッズ管理（GW基準＝get_active_gw_label）
 # ------------------------------------------------------------
 def page_odds_admin(conf: Dict[str, str], me: Dict):
-    render_refresh_bar()
+    render_refresh_bar("odds")
     st.markdown("## オッズ管理")
     is_admin = (me.get("role") == "admin")
     if not is_admin:
