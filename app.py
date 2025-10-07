@@ -48,6 +48,10 @@ table {width:100%}
 /* ログイン見出し（枠なし・少し大きめ。安全策） */
 .login-title{font-size:1.5rem; font-weight:700; margin:0 0 8px 2px;}
 .login-area{padding:2px 0 0;} /* 余白のみ。枠は出さない */
+
+/* 右上のユーティリティバー（目立ちすぎない） */
+.util-bar{display:flex; justify-content:flex-end; gap:8px; margin:-10px 2px 6px 0;}
+.util-btn{border:1px solid rgba(120,120,120,.25); border-radius:8px; padding:2px 8px; background:rgba(255,255,255,.03); font-size:.9rem;}
 </style>
 """
 st.set_page_config(page_title="Premier Picks", layout="wide")
@@ -101,7 +105,39 @@ def _parse_gw_number(gw_name: str):
     except Exception:
         return None
 
-# ★ 追加：与えたGW表記（"GW7"や"7"）でマッチ取得（両表記を順番に試す）
+# ------------------------------------------------------------
+# キャッシュ・スナップショット戦略
+#  - ログイン時のスナップショットを既定として使用
+#  - 「データ更新」クリックでのみ世代(rev)を進めて再取得
+# ------------------------------------------------------------
+def _data_rev() -> int:
+    return int(st.session_state.get("_data_rev", 0))
+
+@st.cache_data(show_spinner=False)
+def _cached_sheet_rows(sheet: str, rev: int):
+    return read_rows_by_sheet(sheet) or []
+
+@st.cache_data(show_spinner=False)
+def _cached_fetch_matches_by_gw(conf: Dict[str, str], gw_label: str, rev: int):
+    ms, gw = fetch_matches_by_gw(conf, gw_label)
+    return ms or [], gw
+
+@st.cache_data(show_spinner=False)
+def _cached_fetch_scores(conf: Dict[str, str], ids_tuple: tuple, rev: int):
+    ids = list(ids_tuple)
+    return fetch_scores_for_match_ids(conf, ids) or {}
+
+def rows(sheet: str):
+    return _cached_sheet_rows(sheet, _data_rev())
+
+def api_matches_by_gw(conf: Dict[str, str], gw_label: str):
+    ms, _ = _cached_fetch_matches_by_gw(conf, gw_label, _data_rev())
+    return ms
+
+def api_scores(conf: Dict[str, str], ids: List[str]):
+    return _cached_fetch_scores(conf, tuple(ids), _data_rev())
+
+# ★ 追加：与えたGW表記（"GW7"や"7"）でマッチ取得（両表記を順番に試す／キャッシュ利用）
 def _fetch_matches_by_gw_any(conf: Dict[str, str], gw_label: str) -> List[Dict]:
     variants = []
     n = _parse_gw_number(gw_label)
@@ -115,7 +151,7 @@ def _fetch_matches_by_gw_any(conf: Dict[str, str], gw_label: str) -> List[Dict]:
             continue
         seen.append(v)
         try:
-            ms, _ = fetch_matches_by_gw(conf, v)
+            ms = api_matches_by_gw(conf, v)
             if ms:
                 return ms
         except Exception:
@@ -125,7 +161,7 @@ def _fetch_matches_by_gw_any(conf: Dict[str, str], gw_label: str) -> List[Dict]:
 # ------------------------------------------------------------
 # 設定読込
 # ------------------------------------------------------------
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_conf() -> Dict[str, str]:
     return read_config_map()
 
@@ -137,6 +173,20 @@ def get_users(conf: Dict[str, str]) -> List[Dict]:
         return json.loads(users_json)
     except Exception:
         return [{"username": "guest", "password": "guest", "role": "user", "team": ""}]
+
+# ------------------------------------------------------------
+# 右上：データ更新ボタン（景観控えめ）
+# ------------------------------------------------------------
+def render_refresh_bar():
+    st.markdown('<div class="util-bar"></div>', unsafe_allow_html=True)
+    cols = st.columns([1, 0.17])
+    with cols[-1]:
+        if st.button("データ更新", key="btn_data_refresh", use_container_width=True):
+            # 世代を進めてキャッシュ全クリア → 同じタブのまま再実行
+            st.session_state["_data_rev"] = _data_rev() + 1
+            st.cache_data.clear()
+            st.toast("最新データを取得しました。", icon="✅")
+            st.rerun()
 
 # ------------------------------------------------------------
 # 認証（ログイン後はUIを描画しない） ★枠ナシ見出し（既存維持）
@@ -164,6 +214,8 @@ def login_ui(conf: Dict[str, str]) -> Dict:
             if selected and pwd == selected.get("password", ""):
                 st.session_state["signed_in"] = True
                 st.session_state["me"] = selected
+                # ★ ログイン直後はスナップショット世代を0に初期化
+                st.session_state["_data_rev"] = 0
                 st.success(f"ようこそ {selected['username']} さん！")
                 # ログイン成功時に一度だけ同期フラグを落とす
                 st.session_state.pop("_synced_once", None)
@@ -194,9 +246,8 @@ def gw_and_lock_state(conf: Dict[str, str], matches: List[Dict]) -> Tuple[str, b
 def _get_bm_counts(users: List[str]) -> Dict[str, int]:
     counts = {u: 0 for u in users}
     try:
-        rows = read_rows_by_sheet("bm_log") or []
-        for r in rows:
-            # ★ 変更：bookmaker 列にも対応
+        rows_ = rows("bm_log")
+        for r in rows_:
             u = str(r.get("bookmaker") or r.get("user") or "").strip()
             if u in counts:
                 counts[u] += 1
@@ -210,23 +261,21 @@ def _pick_next_bm(users: List[str], counts: Dict[str, int]) -> str:
 
 # ========== 追加：このGWのブックメーカーを取得 ==========
 def get_bookmaker_for_gw(gw_name: str) -> str:
-    """bm_log から該当GWのBM名を返す。'GW7' と '7' の両方に対応。"""
-    rows = read_rows_by_sheet("bm_log") or []
+    rows_ = rows("bm_log")
     targets = {str(gw_name).strip(), str(gw_name).replace("GW", "").strip()}
-    for r in rows:
+    for r in rows_:
         gw_cell = str(r.get("gw", "")).strip()
         gw_num = str(r.get("gw_number", "")).strip()
         if gw_cell in targets or gw_num in targets:
-            # 列名の揺れに対応（bookmaker or user）
             return str(r.get("bookmaker") or r.get("user") or "").strip()
     return ""
 
 # ★ 追加：bm_log の最新GW番号を返す（なければ None）
 def _get_latest_gw_number_in_bm_log() -> int:
     try:
-        rows = read_rows_by_sheet("bm_log") or []
+        rows_ = rows("bm_log")
         cand = []
-        for r in rows:
+        for r in rows_:
             n = None
             if r.get("gw_number"):
                 try:
@@ -250,7 +299,7 @@ def _is_gw_finished(conf: Dict[str, str], gw_label: str) -> bool:
         ids = [norm_id(m.get("id")) for m in matches if m.get("id")]
         if not ids:
             return False
-        scores = fetch_scores_for_match_ids(conf, ids) or {}
+        scores = api_scores(conf, ids)
         def _done(s):
             stt = (s.get("status") or "").upper()
             return stt in ("FINISHED", "AWARDED")
@@ -278,27 +327,18 @@ def get_active_gw_label(conf: Dict[str, str]) -> str:
         prev_label = f"GW{latest_n}"
         next_label = f"GW{latest_n + 1}"
 
-        # 最終節ガード：最新が最終節以上なら“次”は存在しないので最新を返す
         if latest_n >= gw_max:
             return prev_label
-
-        # 最新が終わっていたら → 次節を“現在アクティブ”として扱う
         if _is_gw_finished(conf, prev_label):
             return next_label
-
-        # まだ終わっていなければ → 最新を“現在アクティブ”として扱う
         return prev_label
     except Exception:
-        # フォールバック
         return conf.get("current_gw", "").strip()
-
 
 # ★ 変更：bm_log の「最新GW+1」を“次節”として自動確定して追記（より厳密）
 def auto_assign_bm_if_needed(conf: Dict[str, str]):
     try:
-        # --- GW最大値を制御 ---
         gw_max = parse_int(conf.get("gw_max", 38), 38)
-
         latest_n = _get_latest_gw_number_in_bm_log()
         if latest_n is None:
             return
@@ -307,19 +347,13 @@ def auto_assign_bm_if_needed(conf: Dict[str, str]):
         next_n = latest_n + 1
         next_label = f"GW{next_n}"
 
-        # --- すでに次節が登録済みなら何もしない ---
         if get_bookmaker_for_gw(next_label):
             return
-
-        # --- 範囲外ならスキップ ---
         if next_n > gw_max:
             return
-
-        # --- 前節が未完了ならスキップ ---
         if not _is_gw_finished(conf, prev_label):
             return
 
-        # --- ここでGW+1を強制確定 ---
         users_conf = get_users(conf)
         users = [u["username"] for u in users_conf]
         counts = _get_bm_counts(users)
@@ -361,15 +395,13 @@ def _toast_next_bm_once(conf: Dict[str, str], me: Dict):
 
 # ------------------------------------------------------------
 # ★★★ 追加：結果同期＋自動精算（result & bets を更新）＋ fd_match_id 自動補完 ★★★
+#   ※ 同期処理は“書き込み”なのでキャッシュを使わず生I/Oで実施
 # ------------------------------------------------------------
 def sync_results_and_settle(conf: Dict[str, str]):
-    """resultシートに確定スコアを反映し、betsを自動精算。odds.fd_match_id の欠落はGW単位で自動補完。"""
     try:
-        # odds/bets を読み込み
         odds_rows = read_rows_by_sheet("odds") or []
         bets_rows = read_rows_by_sheet("bets") or []
 
-        # --- (A) fd_match_id が空の行を救済：GWでAPI検索し補完 ---
         def _norm_name(s: str) -> str:
             s = (s or "").lower().strip()
             for t in [" fc", ".", ",", "-", "  "]:
@@ -379,7 +411,7 @@ def sync_results_and_settle(conf: Dict[str, str]):
         need_fix = [r for r in odds_rows if not str(r.get("fd_match_id") or "").strip()
                     and str(r.get("gw") or "").strip() and str(r.get("home") or "").strip() and str(r.get("away") or "").strip()]
         gw_set = sorted({str(r.get("gw")).strip() for r in need_fix})
-        fd_lookup_by_gw = {}  # gw -> { (home_norm,away_norm) : fd_id }
+        fd_lookup_by_gw = {}
         for gw in gw_set:
             try:
                 api_matches, _ = fetch_matches_by_gw(conf, gw)
@@ -406,7 +438,6 @@ def sync_results_and_settle(conf: Dict[str, str]):
         if fixed_any:
             odds_rows = read_rows_by_sheet("odds") or []
 
-        # --- (B) 内部ID→FD ID のマップ（odds 起点） ※すべて正規化 ---
         in2fd = {}
         meta_by_fd = {}
         for r in odds_rows:
@@ -420,19 +451,15 @@ def sync_results_and_settle(conf: Dict[str, str]):
                     "away": r.get("away", ""),
                 }
 
-        # API問い合わせは FD ID のみ（正規化済）
         candidate_fd_ids = sorted({v for v in in2fd.values() if v})
         if not candidate_fd_ids:
             return
 
-        # 既存の結果マップ（キー=FD ID 正規化）
         result_rows = read_rows_by_sheet("result") or []
         result_by_fd = {norm_id(r.get("match_id")): r for r in result_rows if r.get("match_id")}
 
-        # 最新スコア取得（FD ID）
         scores = fetch_scores_for_match_ids(conf, candidate_fd_ids) or {}
 
-        # --- (C) result を更新／追加（FINISHED or AWARDED のみ） ---
         for fd in candidate_fd_ids:
             sc = scores.get(fd) or {}
             status = (sc.get("status") or "").upper()
@@ -447,7 +474,7 @@ def sync_results_and_settle(conf: Dict[str, str]):
                (parse_int(exist.get("away_score"), -999) != away_score) or \
                ((exist.get("status") or "").upper() != status):
                 row = {
-                    "match_id": fd,                # ← result の主キーは FD ID（正規化済）
+                    "match_id": fd,
                     "gw": exist.get("gw") or meta.get("gw", ""),
                     "home": exist.get("home") or meta.get("home", ""),
                     "away": exist.get("away") or meta.get("away", ""),
@@ -455,7 +482,6 @@ def sync_results_and_settle(conf: Dict[str, str]):
                     "home_score": str(home_score),
                     "away_score": str(away_score),
                     "winner": winner,
-                    # resultシートの見出しに合わせる
                     "finalized_at": datetime.utcnow().isoformat(timespec="seconds"),
                     "source": "football-data",
                     "raw_json": "",
@@ -464,7 +490,6 @@ def sync_results_and_settle(conf: Dict[str, str]):
                 upsert_row("result", row, key_col="match_id")
                 result_by_fd[fd] = row
 
-        # --- (D) bets を自動精算（OPEN で result があるもの） ---
         if result_by_fd:
             for b in bets_rows:
                 if (b.get("status") or "").upper() != "OPEN":
@@ -492,15 +517,14 @@ def sync_results_and_settle(conf: Dict[str, str]):
                     "settled_at": datetime.utcnow().isoformat(timespec="seconds"),
                 })
                 upsert_row("bets", row, key_col="key")
-        # 何もなくても黙って終了（冪等）
     except Exception:
-        # 同期失敗はUIに影響しないよう握りつぶし
         pass
 
 # ------------------------------------------------------------
-# UI: トップ（BM表示＋カウンタ） － 既存維持
+# UI: トップ（BM表示＋カウンタ）
 # ------------------------------------------------------------
 def page_home(conf: Dict[str, str], me: Dict):
+    render_refresh_bar()
     st.markdown("## トップ")
     st.info("ここでは簡単なガイドだけを表示。実際の操作は上部タブから。")
     if me:
@@ -509,7 +533,6 @@ def page_home(conf: Dict[str, str], me: Dict):
     users_conf = get_users(conf)
     users = [u["username"] for u in users_conf]
 
-    # ---- ここがポイント：bm_logの「最新GW = 今節」のBMをそのまま使う ----
     latest_n = _get_latest_gw_number_in_bm_log()
     current_bm = ""
     current_gw_label = ""
@@ -517,7 +540,6 @@ def page_home(conf: Dict[str, str], me: Dict):
         current_gw_label = f"GW{latest_n}"
         current_bm = get_bookmaker_for_gw(current_gw_label)
 
-    # 表示用：今節のBMが分かるようにカードを塗り分け
     st.markdown('<div class="section">今節のメンバー（bm_log基準）</div>', unsafe_allow_html=True)
     st.markdown('<div class="role-cards">', unsafe_allow_html=True)
     for u in users:
@@ -533,39 +555,30 @@ def page_home(conf: Dict[str, str], me: Dict):
         st.markdown(html, unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # 補足情報
     if current_gw_label:
         st.caption(f"今節: {current_gw_label}／Bookmaker: {current_bm or '-'}（bm_logの最新行を参照）")
 
-    # 担当回数のKPIは従来どおり
     counts = _get_bm_counts(users)
     st.markdown('<div class="section">ブックメーカー担当回数（これまで）</div>', unsafe_allow_html=True)
     badges = " ".join([f'<span class="badge">{u}: {counts.get(u,0)}</span>' for u in users])
     st.markdown(f'<div class="badges">{badges}</div>', unsafe_allow_html=True)
-    
 
 # ------------------------------------------------------------
-# UI: 試合とベット（← 修正：GW基準を get_active_gw_label に統一）
+# UI: 試合とベット（GW基準＝get_active_gw_label）
 # ------------------------------------------------------------
 def page_matches_and_bets(conf: Dict[str, str], me: Dict):
+    render_refresh_bar()
     st.markdown("## 試合とベット")
 
-    # ★ bm_logを基準に「今アクティブなGW」を取得
     gw_name = get_active_gw_label(conf)
-
-    # 今節のBookmakerをbm_logから取得
     current_bm = get_bookmaker_for_gw(gw_name)
-
-    # 試合データはAPIから取得（空でもOK）
     matches_raw = _fetch_matches_by_gw_any(conf, gw_name)
 
-    # BM本人はベット禁止
     if current_bm and me.get("username") == current_bm:
         st.warning(f"このGW（{gw_name}）はあなたがブックメーカーです。ベッティングは禁止です。")
         return
 
-    bets_all = read_rows_by_sheet("bets")
-    # 自分のこのGWのベット一覧
+    bets_all = rows("bets")
     my_gw_bets = [b for b in bets_all if (b.get("user") == me["username"] and (b.get("gw") == gw_name or b.get("gw") == gw_name.replace("GW","")))]
     my_total = sum(parse_int(b.get("stake", 0)) for b in my_gw_bets)
     max_total = parse_int(conf.get("max_total_stake_per_gw", 5000), 5000)
@@ -575,15 +588,15 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
         st.info("このGWに表示できる試合がありません。")
         return
 
-    odds_rows = read_rows_by_sheet("odds")
+    odds_rows = rows("odds")
     odds_by_match = {str(r.get("match_id")): r for r in odds_rows if r.get("match_id")}
 
     step = parse_int(conf.get("stake_step", 100), 100)
     lock_minutes = parse_int(conf.get("odds_freeze_minutes_before_first", 120), 120)
 
     def latest_my_bet_for_match(match_id: str):
-        rows = [b for b in my_gw_bets if str(b.get("match_id")) == match_id]
-        if not rows:
+        rows_ = [b for b in my_gw_bets if str(b.get("match_id")) == match_id]
+        if not rows_:
             return None
         def _row_ts(b):
             ts = b.get("placed_at") or ""
@@ -598,8 +611,8 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
                     except Exception:
                         return datetime.min.replace(tzinfo=None)
                 return datetime.min.replace(tzinfo=None)
-        rows.sort(key=_row_ts, reverse=True)
-        return rows[0]
+        rows_.sort(key=_row_ts, reverse=True)
+        return rows_[0]
 
     picks, stakes = {}, {}
     defaults, odds_map, meta_home = {}, {}, {}
@@ -678,86 +691,90 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
 
         submitted_bulk = st.form_submit_button("このGWのベットを一括保存", use_container_width=True)
 
+    # ★ デバウンス：多重保存を抑止
     if submitted_bulk:
-        proposed_total = my_total
-        for mid in stakes.keys():
-            if locked_map.get(mid) or not ready_map.get(mid):
-                continue
-            proposed_total += int(stakes[mid]) - int(defaults[mid])
-
-        if proposed_total > max_total:
-            st.warning(f"このGWの投票上限（{max_total:,}）を超えます。現在 {my_total:,} → 変更後 {proposed_total:,}")
+        if st.session_state.get("_bets_saving"):
+            st.info("保存処理中です…（二重送信は無視されます）")
             return
+        st.session_state["_bets_saving"] = True
+        try:
+            proposed_total = my_total
+            for mid in stakes.keys():
+                if locked_map.get(mid) or not ready_map.get(mid):
+                    continue
+                proposed_total += int(stakes[mid]) - int(defaults[mid])
 
-        saved, skipped = 0, []
-        for mid in stakes.keys():
-            if locked_map.get(mid):
-                skipped.append((mid, "ロック済のためスキップ"))
-                continue
-            if not ready_map.get(mid):
-                skipped.append((mid, "オッズ未確定のためスキップ"))
-                continue
+            if proposed_total > max_total:
+                st.warning(f"このGWの投票上限（{max_total:,}）を超えます。現在 {my_total:,} → 変更後 {proposed_total:,}")
+                return
 
-            new_pick = picks[mid]
-            new_stake = int(stakes[mid])
-            old_stake = int(defaults[mid])
+            saved, skipped = 0, []
+            for mid in stakes.keys():
+                if locked_map.get(mid):
+                    skipped.append((mid, "ロック済のためスキップ"))
+                    continue
+                if not ready_map.get(mid):
+                    skipped.append((mid, "オッズ未確定のためスキップ"))
+                    continue
 
-            last = latest_my_bet_for_match(mid)
-            old_pick = (last.get("pick") if last else "HOME")
-            if (new_pick == old_pick) and (new_stake == old_stake):
-                continue
+                new_pick = picks[mid]
+                new_stake = int(stakes[mid])
+                old_stake = int(defaults[mid])
 
-            use_odds = odds_map[mid][new_pick]
-            fixed_key = f"{gw_name}:{me['username']}:{mid}"
-            row = {
-                "key": fixed_key,
-                "gw": gw_name,
-                "user": me["username"],
-                "match_id": mid,
-                "match": meta_home[mid],
-                "pick": new_pick,
-                "stake": str(int(new_stake)),
-                "odds": str(use_odds),
-                "placed_at": datetime.utcnow().isoformat(timespec="seconds"),
-                "status": "OPEN",
-                "result": "", "payout": "", "net": "", "settled_at": "",
-            }
-            upsert_row("bets", row, key_col="key")
-            saved += 1
+                last = next((b for b in my_gw_bets if str(b.get("match_id")) == mid), None)
+                old_pick = (last.get("pick") if last else "HOME")
+                if (new_pick == old_pick) and (new_stake == old_stake):
+                    continue
 
-        if saved > 0:
-            st.success(f"ベットを一括保存しました（更新 {saved} 件）。")
-        if skipped:
-            msg = " / ".join([f"{k}: {reason}" for k, reason in skipped])
-            st.info(f"スキップ：{msg}")
+                use_odds = odds_map[mid][new_pick]
+                fixed_key = f"{gw_name}:{me['username']}:{mid}"
+                row = {
+                    "key": fixed_key,
+                    "gw": gw_name,
+                    "user": me["username"],
+                    "match_id": mid,
+                    "match": meta_home[mid],
+                    "pick": new_pick,
+                    "stake": str(int(new_stake)),
+                    "odds": str(use_odds),
+                    "placed_at": datetime.utcnow().isoformat(timespec="seconds"),
+                    "status": "OPEN",
+                    "result": "", "payout": "", "net": "", "settled_at": "",
+                }
+                upsert_row("bets", row, key_col="key")
+                saved += 1
+
+            if saved > 0:
+                st.success(f"ベットを一括保存しました（更新 {saved} 件）。")
+            if skipped:
+                msg = " / ".join([f"{k}: {reason}" for k, reason in skipped])
+                st.info(f"スキップ：{msg}")
+        finally:
+            st.session_state["_bets_saving"] = False
 
 # ------------------------------------------------------------
-# UI: 履歴（★ここだけ最小改修：ユーザー切替を追加）
+# UI: 履歴（ユーザー切替あり）
 # ------------------------------------------------------------
 def page_history(conf: Dict[str, str], me: Dict):
+    render_refresh_bar()
     st.markdown("## 履歴")
 
-    bets = read_rows_by_sheet("bets")
+    bets = rows("bets")
     if not bets:
         st.info("履歴はまだありません。")
         return
 
-    # 1) 既存のGWセレクトは維持
     gw_vals = {(b.get("gw") if b.get("gw") not in (None, "") else "") for b in bets}
     gw_set = sorted(gw_vals, key=_gw_sort_key)
     sel_gw = st.selectbox("表示するGW", gw_set, index=0 if gw_set else None, key="hist_gw")
 
-    # 2) 追加：ユーザー切替（既定=自分、必要なら他人も）
     all_users = sorted({b.get("user") for b in bets if b.get("user")})
     my_name = me.get("username")
     admin_only = str(conf.get("admin_only_view_others", "false")).lower() == "true"
     can_view_others = (me.get("role") == "admin") or (not admin_only)
 
-    # セレクタの候補（自分＋許可されている場合のみ他人）
     opts = [my_name] + [u for u in all_users if u != my_name and can_view_others]
-    # ラベルをわかりやすく（自分にはマーク）
     label_map = {u: (f"{u}（自分）" if u == my_name else u) for u in opts}
-    # 表示はラベルだが、内部はユーザー名で扱う
     sel_label = st.selectbox(
         "ユーザー",
         [label_map[u] for u in opts],
@@ -765,17 +782,14 @@ def page_history(conf: Dict[str, str], me: Dict):
         key="hist_user",
         help="既定は自分。他ユーザーはプレビュー表示（編集はできません）。"
     )
-    # 逆引き
     inv_label = {v: k for k, v in label_map.items()}
     sel_user = inv_label.get(sel_label, my_name)
 
-    # 3) 絞り込み：選択GW × 選択ユーザー
     target = [b for b in bets if (b.get("gw") == sel_gw and b.get("user") == sel_user)]
     if not target:
         st.info("対象のデータがありません。")
         return
 
-    # 4) KPI（選択ユーザーで再計算）
     total_stake = sum(parse_int(b.get("stake", 0)) for b in target)
     total_payout = sum(parse_float(b.get("payout"), 0.0) or 0.0 for b in target if (b.get("result") in ["WIN","LOSE"]))
     total_net = total_payout - total_stake
@@ -789,27 +803,7 @@ def page_history(conf: Dict[str, str], me: Dict):
     """
     st.markdown(kpi_html, unsafe_allow_html=True)
 
-    # --- 追加：このGWのBM損益を表示 ---
-    current_bm = get_bookmaker_for_gw(sel_gw)
-    if current_bm:
-        gw_all = [b for b in bets if b.get("gw") == sel_gw]
-        # 各ユーザーの確定net（未確定は0扱い）
-        user_net = {}
-        for u in {b.get("user") for b in gw_all if b.get("user")}:
-            ub = [b for b in gw_all if b.get("user") == u]
-            stake_sum = sum(parse_int(x.get("stake", 0)) for x in ub if (x.get("result") in ["WIN","LOSE"]))
-            payout_sum = sum(parse_float(x.get("payout"), 0.0) or 0.0 for x in ub if (x.get("result") in ["WIN","LOSE"]))
-            user_net[u] = payout_sum - stake_sum
-        others_net_sum = sum(v for k, v in user_net.items() if k != current_bm)
-        bm_net = -others_net_sum
-        st.markdown(
-            f'<div class="kpi-row"><div class="kpi"><div class="h">このGWのBM損益（{current_bm}）</div><div class="v">{bm_net:,.2f}</div></div></div>',
-            unsafe_allow_html=True
-        )
-
-    # 5) 明細（そのユーザーのみ）— ご指定フォーマットに変更（[Pred]/[Res]）
-    odds_rows = read_rows_by_sheet("odds") or []
-    # GW + match_id → away名
+    odds_rows = rows("odds") or []
     away_lut = {}
     for r in odds_rows:
         gw = str(r.get("gw") or "")
@@ -821,7 +815,6 @@ def page_history(conf: Dict[str, str], me: Dict):
         odds = parse_float(b.get("odds"), 1.0) or 1.0
         result = (b.get("result") or "").upper()
 
-        # [Pred] 勝利チーム名（DRAWは"Draw"）
         pick = (b.get("pick") or "").upper()
         if pick == "HOME":
             pred_team = b.get("match", "")
@@ -842,29 +835,25 @@ def page_history(conf: Dict[str, str], me: Dict):
         row_view(b)
 
 # ------------------------------------------------------------
-# UI: リアルタイム（← 修正：GW基準を get_active_gw_label に統一）
+# UI: リアルタイム（GW基準＝get_active_gw_label）
 # ------------------------------------------------------------
 def page_realtime(conf: Dict[str, str], me: Dict):
+    render_refresh_bar()
     st.markdown("## リアルタイム")
     st.caption("更新ボタンで最新スコアを手動取得。自動更新はしません。")
 
-    # ★ bm_log基準のGWで固定
     gw = get_active_gw_label(conf)
-
-    # このGWの試合をAPIから取得（無くてもOK）
     matches_raw = _fetch_matches_by_gw_any(conf, gw)
 
     api_ids = [norm_id(m["id"]) for m in matches_raw]
     api_meta = {norm_id(m["id"]): {"home": m["home"], "away": m["away"], "utc_kickoff": m.get("utc_kickoff")} for m in matches_raw}
 
-    odds_rows = read_rows_by_sheet("odds")
-    bets_rows = read_rows_by_sheet("bets")
+    odds_rows = rows("odds")
+    bets_rows = rows("bets")
 
-    # このGWに紐づく行に限定
     gw_odds = [r for r in odds_rows if str(r.get("gw", "")) == str(gw)]
     gw_bets = [r for r in bets_rows if str(r.get("gw", "")) == str(gw)]
 
-    # internal_id → fd_id
     in2fd = {}
     for r in gw_odds:
         in_id = norm_id(r.get("match_id"))
@@ -883,7 +872,6 @@ def page_realtime(conf: Dict[str, str], me: Dict):
         if fd:
             bet_ids.append(fd)
 
-    # オッズにあってAPIに無いものもメタに足す（表示用）
     for r in gw_odds:
         fd = norm_id(r.get("fd_match_id"))
         if fd and fd not in api_meta and has_teams(r):
@@ -891,7 +879,7 @@ def page_realtime(conf: Dict[str, str], me: Dict):
 
     candidate_ids = sorted(list({*api_ids, *odds_ids, *bet_ids}))
 
-    scores = fetch_scores_for_match_ids(conf, candidate_ids)
+    scores = api_scores(conf, candidate_ids)
 
     def is_active(fd):
         s = scores.get(fd, {})
@@ -991,24 +979,24 @@ def page_realtime(conf: Dict[str, str], me: Dict):
         s = scores.get(fd, {})
         hs, as_ = s.get("home_score", 0), s.get("away_score", 0)
         st.markdown(f"**{info['home']} vs {info['away']}**　（{s.get('status','-')}　{hs}-{as_}）")
-        rows = [b for b in this_gw_bets if bet_fd(b) == fd]
-        if not rows:
+        rows_ = [b for b in this_gw_bets if bet_fd(b) == fd]
+        if not rows_:
             st.caption("（ベットなし）")
             continue
-        for b in rows:
+        for b in rows_:
             cp = current_payout(b)
             st.caption(f"- {b.get('user')}：{b.get('pick')} / {b.get('stake')} at {b.get('odds')} → 時点 {cp:,.2f}")
 
-    # ▼変更：st.rerun() を削除（押下＝再実行で十分／タブ遷移抑止）
     st.button("スコアを更新", use_container_width=True)
 
 # ------------------------------------------------------------
-# UI: ダッシュボード（既存維持）
+# UI: ダッシュボード
 # ------------------------------------------------------------
 def page_dashboard(conf: Dict[str, str], me: Dict):
+    render_refresh_bar()
     st.markdown("## ダッシュボード")
 
-    bets = read_rows_by_sheet("bets")
+    bets = rows("bets")
     if not bets:
         st.info("データがありません。")
         return
@@ -1087,24 +1075,22 @@ def page_dashboard(conf: Dict[str, str], me: Dict):
             st.caption(f"　- {t}: 的中率 {acc*100:.1f}%（{n}件）／ 累計net {net:,.2f}")
 
 # ------------------------------------------------------------
-# UI: オッズ管理（← 修正：GW基準を get_active_gw_label に統一）
+# UI: オッズ管理（GW基準＝get_active_gw_label）
 # ------------------------------------------------------------
 def page_odds_admin(conf: Dict[str, str], me: Dict):
+    render_refresh_bar()
     st.markdown("## オッズ管理")
     is_admin = (me.get("role") == "admin")
     if not is_admin:
         st.info("閲覧のみ（管理者のみ編集可能）")
 
-    # ★ bm_logを基準にGWを決定
     gw = get_active_gw_label(conf)
-
-    # このGWの試合を取得（APIで無いケースもある）
     matches_raw = _fetch_matches_by_gw_any(conf, gw)
     if not matches_raw:
         st.info(f"{gw} の試合がAPIから取得できません。必要に応じて odds シートに試合を追加してください。")
         return
 
-    odds_rows = read_rows_by_sheet("odds")
+    odds_rows = rows("odds")
     odds_by_match = {str(r.get("match_id")): r for r in odds_rows if r.get("match_id")}
 
     for m in matches_raw:
@@ -1164,9 +1150,7 @@ def main():
     # ★ ログイン後に一度だけ同期（result更新＆bets精算）
     if not st.session_state.get("_synced_once"):
         sync_results_and_settle(conf)
-        # ★ 変更：bm_log の最新GW+1を“次節”とみなして確定
         auto_assign_bm_if_needed(conf)
-        # ★ 追加：次節BMのトースト（セッション初回のみ）
         _toast_next_bm_once(conf, me)
         st.session_state["_synced_once"] = True
 
