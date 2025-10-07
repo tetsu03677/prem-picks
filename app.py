@@ -77,7 +77,7 @@ def parse_float(x, default=None):
 
 def _gw_sort_key(x):
     """GWの並び替え用：GW7 / 7 / None / '' が混在しても安全にソート"""
-    s = "" if x is None else str(x).strip()
+    s = "" if x is None else str(x).trim() if hasattr(str(x), "trim") else str(x).strip()
     n = 999999
     num = ""
     for ch in s:
@@ -104,6 +104,15 @@ def _parse_gw_number(gw_name: str):
         return int(digits) if digits else None
     except Exception:
         return None
+
+# === 追加：GW同値判定（番号ベースで比較）=====================
+def _gw_equal(a: str, b: str) -> bool:
+    na = _parse_gw_number(a)
+    nb = _parse_gw_number(b)
+    if na is not None and nb is not None:
+        return na == nb
+    # フォールバック
+    return (str(a or "").strip() == str(b or "").strip())
 
 # ------------------------------------------------------------
 # キャッシュ・スナップショット戦略
@@ -521,6 +530,86 @@ def sync_results_and_settle(conf: Dict[str, str]):
     except Exception:
         pass
 
+# ============================================================
+# ★★★ 追加（BM損益とユーザー総収支の計算ヘルパー）表示専用 ★★★
+# ============================================================
+def _bm_net_for_gw(bets_rows: List[Dict], gw_label: str, bm_user: str) -> float:
+    """
+    指定GWにおけるBMの損益（= 他メンバー確定net合計 × -1）を返す。
+    - 対象は result が WIN/LOSE の確定ベットのみ
+    - bets.gw は "GW7"/"7" いずれにも対応
+    """
+    if not bm_user:
+        return 0.0
+    # 指定GW・BM以外ユーザー・確定ベット
+    target = [
+        b for b in bets_rows
+        if _gw_equal(b.get("gw"), gw_label)
+        and (b.get("user") or "") != bm_user
+        and (str(b.get("result") or "")).upper() in ("WIN", "LOSE")
+    ]
+    total = 0.0
+    for b in target:
+        stake = parse_int(b.get("stake", 0))
+        payout = parse_float(b.get("payout"), None)
+        if payout is None:
+            # 念のためフォールバック計算（通常はpayout列が埋まっている想定）
+            odds = parse_float(b.get("odds"), 1.0) or 1.0
+            if (str(b.get("result") or "")).upper() == "WIN":
+                payout = stake * odds
+            else:
+                payout = 0.0
+        net = float(payout) - float(stake)
+        total += net
+    return -total  # BM損益
+
+def _user_total_with_bm(bets_rows: List[Dict], bm_logs: List[Dict], users_conf: List[Dict]) -> Dict[str, Dict[str, float]]:
+    """
+    各ユーザーの「総収支」を返す（表示専用、書き込みなし）
+    総収支 = 自分のベットnet（確定のみ） + 自分がBMのGWのBM寄与の合計
+    返り値: { username: {"total_net": float, "bet_net": float, "bm_contrib": float} }
+    """
+    # ユーザー一覧（configベースで必ず表示対象とする）
+    user_names = [u["username"] for u in users_conf]
+
+    # ユーザー別ベットnet集計（確定のみ）
+    bet_net_by_user = {u: 0.0 for u in user_names}
+    for b in bets_rows:
+        u = b.get("user")
+        if u not in bet_net_by_user:
+            continue
+        if (str(b.get("result") or "")).upper() not in ("WIN", "LOSE"):
+            continue
+        stake = parse_int(b.get("stake", 0))
+        payout = parse_float(b.get("payout"), None)
+        if payout is None:
+            odds = parse_float(b.get("odds"), 1.0) or 1.0
+            payout = (stake * odds) if (str(b.get("result") or "")).upper() == "WIN" else 0.0
+        bet_net_by_user[u] += float(payout) - float(stake)
+
+    # ユーザー別BM寄与集計
+    bm_contrib_by_user = {u: 0.0 for u in user_names}
+    for r in bm_logs or []:
+        gw_label = r.get("gw") or r.get("gw_number")
+        bm_user = str(r.get("bookmaker") or r.get("user") or "").strip()
+        if not gw_label or not bm_user:
+            continue
+        if bm_user not in bm_contrib_by_user:
+            continue
+        bm_contrib_by_user[bm_user] += _bm_net_for_gw(bets_rows, str(gw_label), bm_user)
+
+    # 合成
+    out = {}
+    for u in user_names:
+        bet_net = bet_net_by_user.get(u, 0.0)
+        bm_contrib = bm_contrib_by_user.get(u, 0.0)
+        out[u] = {
+            "total_net": bet_net + bm_contrib,
+            "bet_net": bet_net,
+            "bm_contrib": bm_contrib,
+        }
+    return out
+
 # ------------------------------------------------------------
 # UI: トップ（BM表示＋カウンタ）
 # ------------------------------------------------------------
@@ -774,19 +863,50 @@ def page_history(conf: Dict[str, str], me: Dict):
     admin_only = str(conf.get("admin_only_view_others", "false")).lower() == "true"
     can_view_others = (me.get("role") == "admin") or (not admin_only)
 
-    opts = [my_name] + [u for u in all_users if u != my_name and can_view_others]
-    label_map = {u: (f"{u}（自分）" if u == my_name else u) for u in opts}
+    # ★ 追加：そのGWのBMを候補に含める（権限に従う）
+    bm_user = get_bookmaker_for_gw(sel_gw)
+    opts_core = [my_name] + [u for u in all_users if u != my_name and can_view_others]
+    # BMは重複回避（自分がBMならラベルだけBM表示）
+    opts_display = []
+    label_map = {}
+    for u in opts_core:
+        is_bm = _gw_equal(sel_gw, sel_gw) and (u == bm_user)
+        label = f"{u}（BM）" if is_bm else u
+        opts_display.append(label)
+        label_map[label] = {"user": u, "is_bm_label": is_bm}
+
+    # BMが opts_core に含まれていない場合（=自分以外で閲覧不可、かつBM≠自分）→ BM は追加しない
     sel_label = st.selectbox(
         "ユーザー",
-        [label_map[u] for u in opts],
+        opts_display,
         index=0,
         key="hist_user",
         help="既定は自分。他ユーザーはプレビュー表示（編集はできません）。"
     )
-    inv_label = {v: k for k, v in label_map.items()}
-    sel_user = inv_label.get(sel_label, my_name)
+    info = label_map.get(sel_label, {"user": my_name, "is_bm_label": False})
+    sel_user = info["user"]
+    viewing_bm_summary = info["is_bm_label"]  # BM選択時はサマリーのみ表示
 
-    target = [b for b in bets if (b.get("gw") == sel_gw and b.get("user") == sel_user)]
+    # ★ BMサマリー表示モード
+    if viewing_bm_summary:
+        # BM損益 = 他メンバー確定ベットnet合計 × -1
+        bm_net = _bm_net_for_gw(bets, sel_gw, bm_user) if bm_user else 0.0
+        kpi_html = f"""
+        <div class="kpi-row">
+          <div class="kpi"><div class="h">BM（{bm_user or '-'}） 損益（{sel_gw}）</div><div class="v">{bm_net:,.2f}</div></div>
+        </div>
+        """
+        st.markdown(kpi_html, unsafe_allow_html=True)
+
+        # 明細は表示しない（仕様）
+        if not bm_user:
+            st.info("このGWの BM は未登録です（bm_log）。")
+        else:
+            st.caption("※ BMは個別ベット明細を持たないため、サマリーのみ表示します。")
+        return
+
+    # ★ 従来どおり：選択ユーザーのベット明細（BMラベルでない通常表示）
+    target = [b for b in bets if (_gw_equal(b.get("gw"), sel_gw) and b.get("user") == sel_user)]
     if not target:
         st.info("対象のデータがありません。")
         return
@@ -991,7 +1111,7 @@ def page_realtime(conf: Dict[str, str], me: Dict):
     st.button("スコアを更新", use_container_width=True)
 
 # ------------------------------------------------------------
-# UI: ダッシュボード
+# UI: ダッシュボード（全員のトータル収支 = ベットnet + BM寄与）
 # ------------------------------------------------------------
 def page_dashboard(conf: Dict[str, str], me: Dict):
     render_refresh_bar("dashboard")
@@ -1002,18 +1122,25 @@ def page_dashboard(conf: Dict[str, str], me: Dict):
         st.info("データがありません。")
         return
 
-    my_name = me.get("username")
-    my_bets = [b for b in bets if b.get("user") == my_name]
+    users_conf = get_users(conf)
+    bm_logs = rows("bm_log") or []
 
+    totals = _user_total_with_bm(bets, bm_logs, users_conf)
+
+    my_name = me.get("username")
+    my_tot = totals.get(my_name, {"total_net": 0.0, "bet_net": 0.0, "bm_contrib": 0.0})
+
+    # 既存のKPI枠を踏襲：トータル収支だけ BM 寄与込みに置換
+    my_bets = [b for b in bets if b.get("user") == my_name]
     total_stake = sum(parse_int(b.get("stake", 0)) for b in my_bets)
     total_payout = sum((parse_float(b.get("payout"), 0.0) or 0.0)
                        for b in my_bets if (b.get("result") in ["WIN", "LOSE"]))
-    total_net = total_payout - total_stake
+    total_net_display = my_tot["total_net"]  # ← BM寄与込み
 
     st.markdown(
         f"""
         <div class="kpi-row">
-          <div class="kpi"><div class="h">トータル収支（{my_name}）</div><div class="v">{total_net:,.2f}</div></div>
+          <div class="kpi"><div class="h">トータル収支（{my_name}）</div><div class="v">{total_net_display:,.2f}</div></div>
           <div class="kpi"><div class="h">総支出額（stake）</div><div class="v">{total_stake:,}</div></div>
           <div class="kpi"><div class="h">トータル収入額（payout）</div><div class="v">{total_payout:,.2f}</div></div>
         </div>
@@ -1021,8 +1148,9 @@ def page_dashboard(conf: Dict[str, str], me: Dict):
         unsafe_allow_html=True,
     )
 
-    users = sorted(list({b.get("user") for b in bets if b.get("user")}))
-    others = [u for u in users if u != my_name]
+    # 他ユーザー（参考）も「総収支=ベットnet+BM寄与」で表示
+    all_usernames = [u["username"] for u in users_conf]
+    others = [u for u in all_usernames if u != my_name]
     if others:
         st.markdown('<div class="section">他ユーザー（参考）</div>', unsafe_allow_html=True)
         cols = st.columns(max(2, min(4, len(others))))
@@ -1031,15 +1159,16 @@ def page_dashboard(conf: Dict[str, str], me: Dict):
             ustake = sum(parse_int(b.get("stake", 0)) for b in ub)
             upayout = sum((parse_float(b.get("payout"), 0.0) or 0.0)
                           for b in ub if (b.get("result") in ["WIN", "LOSE"]))
-            unat = upayout - ustake
+            unat_total = totals.get(u, {"total_net": 0.0})["total_net"]  # ← BM寄与込み
             with cols[i % len(cols)]:
                 st.markdown(
                     f'<div class="kpi"><div class="h">{u}</div>'
-                    f'<div class="v">{unat:,.2f}</div>'
+                    f'<div class="v">{unat_total:,.2f}</div>'
                     f'<div class="h">stake {ustake:,} / payout {upayout:,.2f}</div></div>',
                     unsafe_allow_html=True
                 )
 
+    # 参考：ユーザー別の「的中率が高いチーム」表示は既存のロジックを維持
     st.markdown('<div class="section">ユーザー別：的中率が高いチーム TOP3（最低3ベット）</div>', unsafe_allow_html=True)
 
     by_team = {}
