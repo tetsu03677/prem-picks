@@ -544,16 +544,14 @@ def page_home(conf: Dict[str, str], me: Dict):
     st.markdown(f'<div class="badges">{badges}</div>', unsafe_allow_html=True)
     
 
-
 # ------------------------------------------------------------
-# UI: 試合とベット（以下、既存維持。ID扱いは内部で正規化）
+# UI: 試合とベット（← 修正：GW基準を get_active_gw_label に統一）
 # ------------------------------------------------------------
 def page_matches_and_bets(conf: Dict[str, str], me: Dict):
     st.markdown("## 試合とベット")
 
-    # ★ bm_logの最新GW（今節）を基準とする
-    latest_n = _get_latest_gw_number_in_bm_log()
-    gw_name = f"GW{latest_n}" if latest_n else conf.get("current_gw", "GW1")
+    # ★ bm_logを基準に「今アクティブなGW」を取得
+    gw_name = get_active_gw_label(conf)
 
     # 今節のBookmakerをbm_logから取得
     current_bm = get_bookmaker_for_gw(gw_name)
@@ -574,7 +572,7 @@ def page_matches_and_bets(conf: Dict[str, str], me: Dict):
     st.markdown(f'<div class="kpi-row"><div class="kpi"><div class="h">このGWのあなたの投票合計</div><div class="v">{my_total:,} / 上限 {max_total:,}</div></div></div>', unsafe_allow_html=True)
 
     if not matches_raw:
-        st.info("7日以内に表示できる試合がありません。")
+        st.info("このGWに表示できる試合がありません。")
         return
 
     odds_rows = read_rows_by_sheet("odds")
@@ -844,24 +842,29 @@ def page_history(conf: Dict[str, str], me: Dict):
         row_view(b)
 
 # ------------------------------------------------------------
-# UI: リアルタイム（ID正規化のみ追加）
+# UI: リアルタイム（← 修正：GW基準を get_active_gw_label に統一）
 # ------------------------------------------------------------
 def page_realtime(conf: Dict[str, str], me: Dict):
     st.markdown("## リアルタイム")
     st.caption("更新ボタンで最新スコアを手動取得。自動更新はしません。")
 
-    matches_raw, gw = fetch_matches_next_gw(conf, day_window=7)
-    if not matches_raw:
-        st.info("試合が見つかりません（APIが403の場合は時間をおいて再試行ください）。")
+    # ★ bm_log基準のGWで固定
+    gw = get_active_gw_label(conf)
+
+    # このGWの試合をAPIから取得（無くてもOK）
+    matches_raw = _fetch_matches_by_gw_any(conf, gw)
+
     api_ids = [norm_id(m["id"]) for m in matches_raw]
     api_meta = {norm_id(m["id"]): {"home": m["home"], "away": m["away"], "utc_kickoff": m.get("utc_kickoff")} for m in matches_raw}
 
     odds_rows = read_rows_by_sheet("odds")
     bets_rows = read_rows_by_sheet("bets")
 
+    # このGWに紐づく行に限定
     gw_odds = [r for r in odds_rows if str(r.get("gw", "")) == str(gw)]
     gw_bets = [r for r in bets_rows if str(r.get("gw", "")) == str(gw)]
 
+    # internal_id → fd_id
     in2fd = {}
     for r in gw_odds:
         in_id = norm_id(r.get("match_id"))
@@ -880,6 +883,7 @@ def page_realtime(conf: Dict[str, str], me: Dict):
         if fd:
             bet_ids.append(fd)
 
+    # オッズにあってAPIに無いものもメタに足す（表示用）
     for r in gw_odds:
         fd = norm_id(r.get("fd_match_id"))
         if fd and fd not in api_meta and has_teams(r):
@@ -1083,7 +1087,7 @@ def page_dashboard(conf: Dict[str, str], me: Dict):
             st.caption(f"　- {t}: 的中率 {acc*100:.1f}%（{n}件）／ 累計net {net:,.2f}")
 
 # ------------------------------------------------------------
-# UI: オッズ管理（既存維持）
+# UI: オッズ管理（← 修正：GW基準を get_active_gw_label に統一）
 # ------------------------------------------------------------
 def page_odds_admin(conf: Dict[str, str], me: Dict):
     st.markdown("## オッズ管理")
@@ -1091,9 +1095,13 @@ def page_odds_admin(conf: Dict[str, str], me: Dict):
     if not is_admin:
         st.info("閲覧のみ（管理者のみ編集可能）")
 
-    matches_raw, gw = fetch_matches_next_gw(conf, day_window=7)
+    # ★ bm_logを基準にGWを決定
+    gw = get_active_gw_label(conf)
+
+    # このGWの試合を取得（APIで無いケースもある）
+    matches_raw = _fetch_matches_by_gw_any(conf, gw)
     if not matches_raw:
-        st.info("対象の試合が見つかりません。")
+        st.info(f"{gw} の試合がAPIから取得できません。必要に応じて odds シートに試合を追加してください。")
         return
 
     odds_rows = read_rows_by_sheet("odds")
