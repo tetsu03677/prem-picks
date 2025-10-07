@@ -296,36 +296,30 @@ def get_active_gw_label(conf: Dict[str, str]) -> str:
 # ★ 変更：bm_log の「最新GW+1」を“次節”として自動確定して追記（より厳密）
 def auto_assign_bm_if_needed(conf: Dict[str, str]):
     try:
-        # ▼▼▼ ここだけ追加：gw_max のガード ▼▼▼
+        # --- GW最大値を制御 ---
         gw_max = parse_int(conf.get("gw_max", 38), 38)
 
         latest_n = _get_latest_gw_number_in_bm_log()
         if latest_n is None:
-            # 初期化されていない場合は何もしない（種行は手動で作成してください）
             return
 
-        # シーズン最終節（gw_max）に到達／超過していたら以降は追加しない
-        if latest_n >= gw_max:
-            return
-
-        prev_label = f"GW{latest_n}"  # 直近に確定済みのGW
+        prev_label = f"GW{latest_n}"
         next_n = latest_n + 1
         next_label = f"GW{next_n}"
 
-        # gw_max を超えるGWは作らない
-        if next_n > gw_max:
-            return
-        # ▲▲▲ 追加はここまで ▲▲▲
-
-        # すでに「最新GW+1」が確定済みなら何もしない
+        # --- すでに次節が登録済みなら何もしない ---
         if get_bookmaker_for_gw(next_label):
             return
 
-        # 前節（最新GW）が全試合確定していなければ次節は確定しない
+        # --- 範囲外ならスキップ ---
+        if next_n > gw_max:
+            return
+
+        # --- 前節が未完了ならスキップ ---
         if not _is_gw_finished(conf, prev_label):
             return
 
-        # ユーザーの並び順と既存回数から次のBMを選出
+        # --- ここでGW+1を強制確定 ---
         users_conf = get_users(conf)
         users = [u["username"] for u in users_conf]
         counts = _get_bm_counts(users)
@@ -339,10 +333,10 @@ def auto_assign_bm_if_needed(conf: Dict[str, str]):
             "bookmaker": next_bm,
             "decided_at": datetime.utcnow().isoformat(timespec="seconds"),
         }
-        # 冪等: gw, gw_number をキーとしてUpsert
         upsert_row("bm_log", row, key_cols=["gw", "gw_number"])
+        return
+
     except Exception:
-        # 自動確定失敗はUIに影響しないよう握りつぶし
         pass
 
 # ★ 追加：次節BMのトースト通知（セッション内で初回だけ）
