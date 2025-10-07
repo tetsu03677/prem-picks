@@ -1290,6 +1290,11 @@ def page_odds_admin(conf: Dict[str, str], me: Dict):
             msg = " / ".join([f"{label}: {reason}" for (label, reason) in skipped])
             st.info(f"スキップ：{msg}")
 
+        # ★ 保存直後に最新を即反映（キャッシュ世代を進め、再描画）
+        st.session_state["_data_rev"] = _data_rev() + 1
+        st.cache_data.clear()
+        st.rerun()
+
 # ------------------------------------------------------------
 # メイン
 # ------------------------------------------------------------
