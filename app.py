@@ -514,20 +514,20 @@ def page_home(conf: Dict[str, str], me: Dict):
 
     users_conf = get_users(conf)
     users = [u["username"] for u in users_conf]
-    counts = _get_bm_counts(users)
 
-    # ★ 変更：bm_log 上で確定している「次節」のBMを優先表示
+    # ---- ここがポイント：bm_logの「最新GW = 今節」のBMをそのまま使う ----
     latest_n = _get_latest_gw_number_in_bm_log()
-    bm_from_log = ""
+    current_bm = ""
+    current_gw_label = ""
     if latest_n is not None:
-        bm_from_log = get_bookmaker_for_gw(f"GW{latest_n+1}")
-    next_bm = bm_from_log or _pick_next_bm(users, counts)
-    players = [u for u in users if u != next_bm]
+        current_gw_label = f"GW{latest_n}"
+        current_bm = get_bookmaker_for_gw(current_gw_label)
 
-    st.markdown('<div class="section">次節のメンバー</div>', unsafe_allow_html=True)
+    # 表示用：今節のBMが分かるようにカードを塗り分け
+    st.markdown('<div class="section">今節のメンバー（bm_log基準）</div>', unsafe_allow_html=True)
     st.markdown('<div class="role-cards">', unsafe_allow_html=True)
     for u in users:
-        is_bm = (u == next_bm)
+        is_bm = (u == current_bm)
         role_txt = "Bookmaker" if is_bm else "Player"
         card_class = "role-card bm" if is_bm else "role-card"
         html = (
@@ -539,12 +539,17 @@ def page_home(conf: Dict[str, str], me: Dict):
         st.markdown(html, unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown('<div class="section">プレイヤー</div>', unsafe_allow_html=True)
-    st.write(", ".join(players) if players else "-")
+    # 補足情報
+    if current_gw_label:
+        st.caption(f"今節: {current_gw_label}／Bookmaker: {current_bm or '-'}（bm_logの最新行を参照）")
 
+    # 担当回数のKPIは従来どおり
+    counts = _get_bm_counts(users)
     st.markdown('<div class="section">ブックメーカー担当回数（これまで）</div>', unsafe_allow_html=True)
     badges = " ".join([f'<span class="badge">{u}: {counts.get(u,0)}</span>' for u in users])
     st.markdown(f'<div class="badges">{badges}</div>', unsafe_allow_html=True)
+    
+
 
 # ------------------------------------------------------------
 # UI: 試合とベット（以下、既存維持。ID扱いは内部で正規化）
