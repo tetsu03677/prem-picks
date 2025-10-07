@@ -1256,6 +1256,8 @@ def page_odds_admin(conf: Dict[str, str], me: Dict):
     # 送信後：各試合の入力値を読み取り、一括で upsert
     if submitted_all and is_admin:
         saved, skipped = 0, []
+        saved_map: Dict[str, Dict[str, float]] = {}  # mid -> {"HOME":x,"DRAW":y,"AWAY":z}
+
         for m in matches_raw:
             mid = str(m["id"])
             try:
@@ -1281,8 +1283,50 @@ def page_odds_admin(conf: Dict[str, str], me: Dict):
                 }
                 upsert_row("odds", row, key_cols=["match_id", "gw"])
                 saved += 1
+
+                # ★ 保存した新オッズを控える（bets の上書き用）
+                saved_map[mid] = {"HOME": home, "DRAW": draw, "AWAY": away}
+
             except Exception:
                 skipped.append((f"{m['home']} vs {m['away']}", "保存時に予期せぬエラー"))
+
+        # ★ ここから：既存 bets（OPEN）のオッズを最新に上書き
+        #   - 対象: 現在GW == gw、status == OPEN の行
+        #   - pick(HOME/DRAW/AWAY)に応じて新オッズ saved_map[mid] を反映
+        try:
+            if saved_map:
+                bets_rows = read_rows_by_sheet("bets") or []
+                updated = 0
+                for b in bets_rows:
+                    try:
+                        if str(b.get("gw")) != str(gw):
+                            continue
+                        if (str(b.get("status") or "")).upper() != "OPEN":
+                            continue
+                        mid = str(b.get("match_id") or "")
+                        if mid not in saved_map:
+                            continue
+                        pick = (b.get("pick") or "").upper()
+                        new_odds = saved_map[mid].get(pick)
+                        if not new_odds:
+                            continue
+                        # 変更不要ならスキップ（小数誤差も考慮しつつ）
+                        old_odds = parse_float(b.get("odds"), None)
+                        if old_odds is not None and abs(float(old_odds) - float(new_odds)) < 1e-9:
+                            continue
+
+                        row = dict(b)
+                        row["odds"] = f"{float(new_odds):.2f}"
+                        row["updated_at"] = datetime.utcnow().isoformat(timespec="seconds")
+                        upsert_row("bets", row, key_col="key")
+                        updated += 1
+                    except Exception:
+                        continue
+
+                if updated > 0:
+                    st.success(f"既存ベットのオッズを更新しました（{updated} 件）。")
+        except Exception:
+            st.info("ベットのオッズ更新で一部スキップが発生しました。")
 
         if saved > 0:
             st.success(f"保存しました（{saved} 試合）。")
