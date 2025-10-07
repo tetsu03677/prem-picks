@@ -1206,6 +1206,7 @@ def page_dashboard(conf: Dict[str, str], me: Dict):
 
 # ------------------------------------------------------------
 # UI: オッズ管理（GW基準＝get_active_gw_label）
+#   ★ 変更：試合ごとの個別保存 → 「このGWのオッズを一括保存」に統一
 # ------------------------------------------------------------
 def page_odds_admin(conf: Dict[str, str], me: Dict):
     render_refresh_bar("odds")
@@ -1223,49 +1224,71 @@ def page_odds_admin(conf: Dict[str, str], me: Dict):
     odds_rows = rows("odds")
     odds_by_match = {str(r.get("match_id")): r for r in odds_rows if r.get("match_id")}
 
-    for m in matches_raw:
-        mid = str(m["id"])
-        od = odds_by_match.get(mid, {})
-        with st.container(border=True):
-            st.markdown(f"**{m['home']} vs {m['away']}**　（{gw}）")
+    # ★ ここから「一括保存」フォーム
+    with st.form("odds_bulk_form", clear_on_submit=False):
+        for m in matches_raw:
+            mid = str(m["id"])
+            od = odds_by_match.get(mid, {})
 
-            with st.form(f"odds_form_{mid}", clear_on_submit=False):
-                c1, c2, c3, c4, c5 = st.columns([1,1,1,0.9,1.2])
+            with st.container(border=True):
+                st.markdown(f"**{m['home']} vs {m['away']}**　（{gw}）")
+
+                c1, c2, c3, c4 = st.columns([1,1,1,1])
                 with c1:
-                    home = st.number_input("Home", min_value=1.01, step=0.1,
-                                           value=parse_float(od.get("home_win"), 1.01),
-                                           key=f"od_h_{mid}", disabled=not is_admin)
+                    st.number_input("Home", min_value=1.01, step=0.1,
+                                    value=parse_float(od.get("home_win"), 1.01),
+                                    key=f"od_h_{mid}", disabled=not is_admin)
                 with c2:
-                    draw = st.number_input("Draw", min_value=1.01, step=0.1,
-                                           value=parse_float(od.get("draw"), 1.01),
-                                           key=f"od_d_{mid}", disabled=not is_admin)
+                    st.number_input("Draw", min_value=1.01, step=0.1,
+                                    value=parse_float(od.get("draw"), 1.01),
+                                    key=f"od_d_{mid}", disabled=not is_admin)
                 with c3:
-                    away = st.number_input("Away", min_value=1.01, step=0.1,
-                                           value=parse_float(od.get("away_win"), 1.01),
-                                           key=f"od_a_{mid}", disabled=not is_admin)
+                    st.number_input("Away", min_value=1.01, step=0.1,
+                                    value=parse_float(od.get("away_win"), 1.01),
+                                    key=f"od_a_{mid}", disabled=not is_admin)
                 with c4:
-                    confirm = st.checkbox("オッズを確定（公開）", value=(str(od.get("locked","")).upper()=="YES"),
-                                          key=f"od_locked_{mid}", disabled=not is_admin)
-                with c5:
-                    submitted = st.form_submit_button("保存", disabled=not is_admin, use_container_width=True)
+                    st.checkbox("オッズを確定（公開）",
+                                value=(str(od.get("locked","")).upper()=="YES"),
+                                key=f"od_locked_{mid}", disabled=not is_admin)
 
-                if submitted and is_admin:
-                    if home <= 1.0 or draw <= 1.0 or away <= 1.0:
-                        st.warning("3つのオッズはすべて 1.01 以上で入力してください。")
-                    else:
-                        row = {
-                            "gw": gw,
-                            "match_id": mid,
-                            "home": m["home"],
-                            "away": m["away"],
-                            "home_win": str(home),
-                            "draw": str(draw),
-                            "away_win": str(away),
-                            "locked": "YES" if confirm else "",
-                            "updated_at": datetime.utcnow().isoformat(timespec="seconds"),
-                        }
-                        upsert_row("odds", row, key_cols=["match_id", "gw"])
-                        st.success("保存しました。")
+        submitted_all = st.form_submit_button("このGWのオッズを一括保存", disabled=not is_admin, use_container_width=True)
+
+    # 送信後：各試合の入力値を読み取り、一括で upsert
+    if submitted_all and is_admin:
+        saved, skipped = 0, []
+        for m in matches_raw:
+            mid = str(m["id"])
+            try:
+                home = float(st.session_state.get(f"od_h_{mid}", 1.01))
+                draw = float(st.session_state.get(f"od_d_{mid}", 1.01))
+                away = float(st.session_state.get(f"od_a_{mid}", 1.01))
+                confirm = bool(st.session_state.get(f"od_locked_{mid}", False))
+
+                if home <= 1.0 or draw <= 1.0 or away <= 1.0:
+                    skipped.append((f"{m['home']} vs {m['away']}", "オッズは3つとも 1.01 以上が必要"))
+                    continue
+
+                row = {
+                    "gw": gw,
+                    "match_id": mid,
+                    "home": m["home"],
+                    "away": m["away"],
+                    "home_win": f"{home}",
+                    "draw": f"{draw}",
+                    "away_win": f"{away}",
+                    "locked": "YES" if confirm else "",
+                    "updated_at": datetime.utcnow().isoformat(timespec="seconds"),
+                }
+                upsert_row("odds", row, key_cols=["match_id", "gw"])
+                saved += 1
+            except Exception:
+                skipped.append((f"{m['home']} vs {m['away']}", "保存時に予期せぬエラー"))
+
+        if saved > 0:
+            st.success(f"保存しました（{saved} 試合）。")
+        if skipped:
+            msg = " / ".join([f"{label}: {reason}" for (label, reason) in skipped])
+            st.info(f"スキップ：{msg}")
 
 # ------------------------------------------------------------
 # メイン
