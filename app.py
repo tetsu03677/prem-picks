@@ -202,9 +202,45 @@ def render_refresh_bar(page_id: str):
 # 認証（ログイン後はUIを描画しない） ★枠ナシ見出し（既存維持）
 # ------------------------------------------------------------
 def login_ui(conf: Dict[str, str]) -> Dict:
+    import streamlit.components.v1 as components
+
+    # すでにサインイン済みならそのまま返す
     if st.session_state.get("signed_in") and st.session_state.get("me"):
         return st.session_state.get("me")
 
+    # --- 画面情報をJSで取得して session_state に格納（毎リラン軽量実行） ---
+    try:
+        js_val = components.html(
+            """
+            <script>
+            (function () {
+              const payload = {
+                display_size: (window.screen && window.screen.width && window.screen.height)
+                  ? (window.screen.width + "x" + window.screen.height)
+                  : null,
+                devicePixelRatio: (window.devicePixelRatio || null)
+              };
+              const msg = {
+                isStreamlitMessage: true,
+                type: "streamlit:setComponentValue",
+                value: payload
+              };
+              window.parent.postMessage(msg, "*");
+            })();
+            </script>
+            """,
+            height=0,
+            scrolling=False,
+        )
+        if isinstance(js_val, dict):
+            if "display_size" in js_val:
+                st.session_state["_client_display_size"] = js_val.get("display_size")
+            if "devicePixelRatio" in js_val:
+                st.session_state["_client_dpr"] = js_val.get("devicePixelRatio")
+    except Exception:
+        pass  # 取れなくてもログは username/time のみで続行
+
+    # --- UI 本体 ---
     with st.container():
         st.markdown('<div class="login-area">', unsafe_allow_html=True)
         st.markdown('<div class="login-title">Premier Picks</div>', unsafe_allow_html=True)
@@ -230,13 +266,13 @@ def login_ui(conf: Dict[str, str]) -> Dict:
 
                 # --- ここでアクセスログを追記 ---
                 try:
-                    # （username, access_time）の組み合わせをキーにしてupsert
-                    # 既に同一時刻が存在しなければ新規行として追加されます
                     upsert_row(
                         "access_log",
                         {
                             "username": selected["username"],
                             "access_time": datetime.utcnow().isoformat(timespec="seconds"),
+                            "display_size": st.session_state.get("_client_display_size", ""),
+                            "devicePixelRatio": str(st.session_state.get("_client_dpr", "")),
                         },
                         key_cols=["username", "access_time"],
                     )
@@ -253,7 +289,6 @@ def login_ui(conf: Dict[str, str]) -> Dict:
         st.markdown("</div>", unsafe_allow_html=True)
 
     return st.session_state.get("me")
-
 
 # ------------------------------------------------------------
 # 共通: GW の判定（参考用）
