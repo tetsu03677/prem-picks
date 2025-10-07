@@ -222,11 +222,28 @@ def login_ui(conf: Dict[str, str]) -> Dict:
         if st.button("ログイン", use_container_width=True, key="btn_login"):
             selected = next((u for u in users if u["username"] == user_sel), None)
             if selected and pwd == selected.get("password", ""):
+                # --- ログイン状態をセット ---
                 st.session_state["signed_in"] = True
                 st.session_state["me"] = selected
-                # ★ ログイン直後はスナップショット世代を0に初期化
-                st.session_state["_data_rev"] = 0
+                st.session_state["_data_rev"] = 0  # スナップショット初期化
                 st.success(f"ようこそ {selected['username']} さん！")
+
+                # --- ここでアクセスログを追記 ---
+                try:
+                    # （username, access_time）の組み合わせをキーにしてupsert
+                    # 既に同一時刻が存在しなければ新規行として追加されます
+                    upsert_row(
+                        "access_log",
+                        {
+                            "username": selected["username"],
+                            "access_time": datetime.utcnow().isoformat(timespec="seconds"),
+                        },
+                        key_cols=["username", "access_time"],
+                    )
+                except Exception:
+                    # ログ書き込みエラーはUXに影響しないよう握りつぶす
+                    pass
+
                 # ログイン成功時に一度だけ同期フラグを落とす
                 st.session_state.pop("_synced_once", None)
                 st.rerun()
@@ -236,6 +253,7 @@ def login_ui(conf: Dict[str, str]) -> Dict:
         st.markdown("</div>", unsafe_allow_html=True)
 
     return st.session_state.get("me")
+
 
 # ------------------------------------------------------------
 # 共通: GW の判定（参考用）
