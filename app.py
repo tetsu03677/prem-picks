@@ -37,9 +37,9 @@ table {width:100%}
 
 /* トップの3分割カード（BM=赤、その他=グレー） */
 .role-cards{display:flex; gap:12px; flex-wrap:wrap}
-.role-card{flex:1 1 0; min-width:120px; border:1px solid rgba(120,120,120,.25); border-radius:12px; padding:12px 14px; background:rgba(255,255,255,.02)}
-.role-card.bm{border-color:rgba(255,0,0,.35); background:rgba(255,255,255,.08)}
-.role-card .name{font-weight:700; font-size:1.05rem}
+.role-card{flex:1 1 0; min-width:120px; border:1px solid rgba(120,120,120,.25); border-radius:12px; padding:12px 14px; background:rgba(255,255,255,.02); position:relative;}
+.role-card.bm{border-color:rgba(255,0,0,.35); background:rgba(255,0,0,.06);}
+.role-card .name{font-weight:700; font-size:1.05rem; position:relative; z-index:1;}
 .role-card .role{font-size:.9rem; color:rgba(255,255,255,.7)}
 .badges{display:flex; gap:8px; flex-wrap:wrap; margin-top:6px}
 .badge{display:inline-block; padding:3px 8px; border-radius:999px; font-size:.85rem;
