@@ -557,13 +557,19 @@ def page_home(conf: Dict[str, str], me: Dict):
 def page_matches_and_bets(conf: Dict[str, str], me: Dict):
     st.markdown("## 試合とベット")
 
-    matches_raw, gw = fetch_matches_next_gw(conf, day_window=7)
-    gw_name = get_active_gw_label(conf)  # ← 追加関数で“アクティブGW”を決定
+    # ★ bm_logの最新GW（今節）を基準とする
+    latest_n = _get_latest_gw_number_in_bm_log()
+    gw_name = f"GW{latest_n}" if latest_n else conf.get("current_gw", "GW1")
 
-    # ===== 追加：BMはこのページでベット禁止 =====
+    # 今節のBookmakerをbm_logから取得
     current_bm = get_bookmaker_for_gw(gw_name)
+
+    # 試合データはAPIから取得（空でもOK）
+    matches_raw = _fetch_matches_by_gw_any(conf, gw_name)
+
+    # BM本人はベット禁止
     if current_bm and me.get("username") == current_bm:
-        st.warning("このGWはあなたがブックメーカーです。ベッティングは禁止です。")
+        st.warning(f"このGW（{gw_name}）はあなたがブックメーカーです。ベッティングは禁止です。")
         return
 
     bets_all = read_rows_by_sheet("bets")
