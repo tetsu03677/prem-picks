@@ -646,7 +646,7 @@ def page_home(conf: Dict[str, str], me: Dict):
     st.markdown("</div>", unsafe_allow_html=True)
 
     if current_gw_label:
-        st.caption(f"今節: {current_gw_label}／Bookmaker: {current_bm or '-'}（bm_logの最新行を参照）")
+        st.caption(f"今節: {current_gw_label}／Bookmaker: {current_bm or '-'}")
 
     counts = _get_bm_counts(users)
     st.markdown('<div class="section">ブックメーカー担当回数（これまで）</div>', unsafe_allow_html=True)
