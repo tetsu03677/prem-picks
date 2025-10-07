@@ -630,7 +630,7 @@ def page_home(conf: Dict[str, str], me: Dict):
         current_gw_label = f"GW{latest_n}"
         current_bm = get_bookmaker_for_gw(current_gw_label)
 
-    st.markdown('<div class="section">今節のメンバー（bm_log基準）</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section">今節のメンバー役割</div>', unsafe_allow_html=True)
     st.markdown('<div class="role-cards">', unsafe_allow_html=True)
     for u in users:
         is_bm = (u == current_bm)
@@ -649,7 +649,7 @@ def page_home(conf: Dict[str, str], me: Dict):
         st.caption(f"今節: {current_gw_label}／Bookmaker: {current_bm or '-'}")
 
     counts = _get_bm_counts(users)
-    st.markdown('<div class="section">ブックメーカー担当回数（これまで）</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section">ブックメーカー担当累計回数</div>', unsafe_allow_html=True)
     badges = " ".join([f'<span class="badge">{u}: {counts.get(u,0)}</span>' for u in users])
     st.markdown(f'<div class="badges">{badges}</div>', unsafe_allow_html=True)
 
