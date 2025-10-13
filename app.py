@@ -170,7 +170,7 @@ def _fetch_matches_by_gw_any(conf: Dict[str, str], gw_label: str) -> List[Dict]:
 # ------------------------------------------------------------
 # 設定読込
 # ------------------------------------------------------------
-@st.cache_data(ttl=180, show_spinner=False)
+@st.cache_data(ttl=360, show_spinner=False)
 def get_conf() -> Dict[str, str]:
     return read_config_map()
 
