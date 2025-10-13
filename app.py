@@ -201,6 +201,7 @@ def render_refresh_bar(page_id: str):
 # ------------------------------------------------------------
 # 認証（ログイン後はUIを描画しない） ★枠ナシ見出し（既存維持）
 # ------------------------------------------------------------
+'''
 def login_ui(conf: Dict[str, str]) -> Dict:
     # --- ① 画面情報をJSで取得し、未取得ならクエリに付与して1回だけリロード ---
     # すでに sw/sh/dpr が付いていなければ、JS で付与して再読み込み
@@ -283,6 +284,107 @@ def login_ui(conf: Dict[str, str]) -> Dict:
                 st.rerun()
             else:
                 st.warning("ユーザー名またはパスワードが違います。」")
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    return st.session_state.get("me")
+    '''
+
+def login_ui(conf: Dict[str, str]) -> Dict:
+    # --- ① 画面情報をJSで取得し、未取得ならクエリに付与して1回だけリロード ---
+    if not {"sw", "sh", "dpr"}.issubset(set(st.query_params.keys())):
+        st.markdown(
+            """
+            <script>
+            (function(){
+              try {
+                const url = new URL(window.location.href);
+                if (!(url.searchParams.has('sw') && url.searchParams.has('sh') && url.searchParams.has('dpr'))) {
+                  url.searchParams.set('sw', String(window.screen.width || window.innerWidth || 0));
+                  url.searchParams.set('sh', String(window.screen.height || window.innerHeight || 0));
+                  url.searchParams.set('dpr', String(window.devicePixelRatio || 1));
+                  url.searchParams.set('_si', '1'); // 再読込フラグ
+                  window.location.replace(url.toString());
+                }
+              } catch(e) {}
+            })();
+            </script>
+            """,
+            unsafe_allow_html=True
+        )
+
+    # 既にログイン済みなら即返す
+    if st.session_state.get("signed_in") and st.session_state.get("me"):
+        return st.session_state.get("me")
+
+    # --- ② タイル選択UI（縦並び） ---
+    with st.container():
+        st.markdown('<div class="login-area">', unsafe_allow_html=True)
+        st.markdown('<div class="login-title">Premier Picks</div>', unsafe_allow_html=True)
+
+        users_conf = get_users(conf)
+        usernames = [u["username"] for u in users_conf]
+
+        st.caption("ログインするユーザーを選んでください")
+        # 縦並びの“タイル風”ボタン
+        for uname in usernames:
+            if st.button(uname, key=f"btn_user_{uname}", use_container_width=True):
+                st.session_state["login_candidate"] = uname
+
+        # --- ③ 確認ブロック（候補が選ばれていたら表示） ---
+        candidate = st.session_state.get("login_candidate")
+        if candidate:
+            st.markdown(f"### 「{candidate}」でログインしますか？")
+            c1, c2 = st.columns(2)
+            with c1:
+                yes = st.button("Yes", key="btn_login_yes", use_container_width=True)
+            with c2:
+                no = st.button("No", key="btn_login_no", use_container_width=True)
+
+            if no:
+                # 候補を破棄して最初の選択画面へ
+                st.session_state.pop("login_candidate", None)
+                st.rerun()
+
+            if yes:
+                # 選択ユーザーの設定を探す（role等を保持するため）
+                selected = next((u for u in users_conf if u["username"] == candidate), {"username": candidate, "role": "user"})
+                # --- ④ ログイン状態をセット ---
+                st.session_state["signed_in"] = True
+                st.session_state["me"] = selected
+                st.session_state["_data_rev"] = 0  # スナップショット初期化
+                st.toast(f"ようこそ {selected['username']} さん！", icon="✅")
+
+                # --- ⑤ access_log に追記（JST時刻 & 画面情報） ---
+                try:
+                    sw = st.query_params.get("sw", None)
+                    sh = st.query_params.get("sh", None)
+                    dpr = st.query_params.get("dpr", None)
+                    display_size = f"{sw}x{sh}" if sw and sh else ""
+                    dpr_str = str(dpr) if dpr is not None else ""
+
+                    # 日本時間（JST）で保存
+                    jst = pytz.timezone("Asia/Tokyo")
+                    access_time_jst = datetime.now(jst).isoformat(timespec="seconds")
+
+                    upsert_row(
+                        "access_log",
+                        {
+                            "username": selected["username"],
+                            "access_time": access_time_jst,   # JSTで保存
+                            "display_size": display_size,
+                            "devicePixelRatio": dpr_str,
+                        },
+                        key_cols=["username", "access_time"],
+                    )
+                except Exception:
+                    # ログ書込みエラーはUXに影響させない
+                    pass
+
+                # 初回同期フラグを落としてからリロード
+                st.session_state.pop("_synced_once", None)
+                st.session_state.pop("login_candidate", None)
+                st.rerun()
 
         st.markdown("</div>", unsafe_allow_html=True)
 
