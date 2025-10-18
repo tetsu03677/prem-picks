@@ -469,50 +469,76 @@ def _toast_next_bm_once(conf: Dict[str, str], me: Dict):
         pass
 
 # ------------------------------------------------------------
-# ★★★ 追加：結果同期＋自動精算（result & bets を更新）＋ fd_match_id 自動補完 ★★★
-#   ※ 同期処理は“書き込み”なのでキャッシュを使わず生I/Oで実施
+# ★★★ 結果同期＋自動精算（result & bets 更新）＋ fd_match_id 自動補完 ★★★
+#   1) まず odds.fd_match_id が空 && match_id あり → そのままコピー（norm_id）
+#   2) それでも空の行だけ、従来のAPI照合（home/away一致）で補完
+#   3) result 更新 → bets 自動精算（既存ロジック）
+#   ※ 書き込み系なのでキャッシュは使わず生I/O
 # ------------------------------------------------------------
 def sync_results_and_settle(conf: Dict[str, str]):
     try:
         odds_rows = read_rows_by_sheet("odds") or []
         bets_rows = read_rows_by_sheet("bets") or []
 
+        # ---------- (1) 超シンプル補完：fd_match_id ← match_id をコピー ----------
+        copied_any = False
+        for r in odds_rows:
+            fd = str(r.get("fd_match_id") or "").strip()
+            mid = str(r.get("match_id") or "").strip()
+            if not fd and mid:
+                newrow = dict(r)
+                newrow["fd_match_id"] = norm_id(mid)
+                newrow["updated_at"] = datetime.utcnow().isoformat(timespec="seconds")
+                upsert_row("odds", newrow, key_cols=["match_id", "gw"])
+                copied_any = True
+
+        if copied_any:
+            # 反映後を再読込
+            odds_rows = read_rows_by_sheet("odds") or []
+
+        # ---------- (2) まだ空のものだけ API 照合で補完（従来のロジック） ----------
         def _norm_name(s: str) -> str:
             s = (s or "").lower().strip()
             for t in [" fc", ".", ",", "-", "  "]:
                 s = s.replace(t, " ")
             return " ".join(s.split())
 
-        need_fix = [r for r in odds_rows if not str(r.get("fd_match_id") or "").strip()
-                    and str(r.get("gw") or "").strip() and str(r.get("home") or "").strip() and str(r.get("away") or "").strip()]
-        gw_set = sorted({str(r.get("gw")).strip() for r in need_fix})
-        fd_lookup_by_gw = {}
-        for gw in gw_set:
-            try:
-                api_matches, _ = fetch_matches_by_gw(conf, gw)
-                lut = {}
-                for m in api_matches:
-                    key = (_norm_name(m["home"]), _norm_name(m["away"]))
-                    lut[key] = norm_id(m["id"])
-                fd_lookup_by_gw[gw] = lut
-            except Exception:
-                fd_lookup_by_gw[gw] = {}
+        need_fix = [
+            r for r in odds_rows
+            if not str(r.get("fd_match_id") or "").strip()
+            and str(r.get("gw") or "").strip()
+            and str(r.get("home") or "").strip()
+            and str(r.get("away") or "").strip()
+        ]
 
-        fixed_any = False
-        for r in need_fix:
-            gw = str(r.get("gw")).strip()
-            key = (_norm_name(r.get("home")), _norm_name(r.get("away")))
-            fd_id = fd_lookup_by_gw.get(gw, {}).get(key)
-            if fd_id:
-                newrow = dict(r)
-                newrow["fd_match_id"] = fd_id
-                newrow["updated_at"] = datetime.utcnow().isoformat(timespec="seconds")
-                upsert_row("odds", newrow, key_cols=["match_id", "gw"])
-                fixed_any = True
+        if need_fix:
+            gw_set = sorted({str(r.get("gw")).strip() for r in need_fix})
+            fd_lookup_by_gw = {}
+            for gw in gw_set:
+                try:
+                    api_matches, _ = fetch_matches_by_gw(conf, gw)
+                    lut = {(_norm_name(m["home"]), _norm_name(m["away"])): norm_id(m["id"])
+                           for m in api_matches}
+                    fd_lookup_by_gw[gw] = lut
+                except Exception:
+                    fd_lookup_by_gw[gw] = {}
 
-        if fixed_any:
-            odds_rows = read_rows_by_sheet("odds") or []
+            fixed_any = False
+            for r in need_fix:
+                gw = str(r.get("gw")).strip()
+                key = (_norm_name(r.get("home")), _norm_name(r.get("away")))
+                fd_id = fd_lookup_by_gw.get(gw, {}).get(key)
+                if fd_id:
+                    newrow = dict(r)
+                    newrow["fd_match_id"] = fd_id
+                    newrow["updated_at"] = datetime.utcnow().isoformat(timespec="seconds")
+                    upsert_row("odds", newrow, key_cols=["match_id", "gw"])
+                    fixed_any = True
 
+            if fixed_any:
+                odds_rows = read_rows_by_sheet("odds") or []
+
+        # ---------- (3) ここから下は既存：result更新 → bets精算 ----------
         in2fd = {}
         meta_by_fd = {}
         for r in odds_rows:
