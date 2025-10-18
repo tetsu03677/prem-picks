@@ -920,7 +920,8 @@ def page_history(conf: Dict[str, str], me: Dict):
         return
 
     gw_vals = {(b.get("gw") if b.get("gw") not in (None, "") else "") for b in bets}
-    gw_set = sorted(gw_vals, key=_gw_sort_key)
+    # ▼ 改修：降順＆最新GWをデフォルト表示
+    gw_set = sorted(gw_vals, key=_gw_sort_key, reverse=True)
     sel_gw = st.selectbox("表示するGW", gw_set, index=0 if gw_set else None, key="hist_gw")
 
     all_users = sorted({b.get("user") for b in bets if b.get("user")})
@@ -1013,9 +1014,10 @@ def page_history(conf: Dict[str, str], me: Dict):
             payout = parse_float(b.get("payout"), stake * odds if result == "WIN" else 0.0) or 0.0
             net = payout - stake
             res_tag = "Hit!!" if result == "WIN" else "Miss"
-            st.markdown(f"・{b.get('user','')}｜[Pred] {pred_team}｜[Res] {res_tag}｜{stake} at {odds:.2f}→{payout:.2f}（net {net:.2f}）")
+            # ▼ 改修：ユーザー名を表示しない
+            st.markdown(f"・[Pred] {pred_team}｜[Res] {res_tag}｜{stake} at {odds:.2f}→{payout:.2f}（net {net:.2f}）")
         else:
-            st.markdown(f"・{b.get('user','')}｜[Pred] {pred_team}｜[Res] -｜{stake} at {odds:.2f}→-（net -）")
+            st.markdown(f"・[Pred] {pred_team}｜[Res] -｜{stake} at {odds:.2f}→-（net -）")
 
     for b in target:
         row_view(b)
@@ -1187,6 +1189,7 @@ def page_realtime(conf: Dict[str, str], me: Dict):
 
 # ------------------------------------------------------------
 # UI: ダッシュボード（全員のトータル収支 = ベットnet + BM寄与）
+#            ＋ 見込みを含めるトグル／節ごとの内訳
 # ------------------------------------------------------------
 def page_dashboard(conf: Dict[str, str], me: Dict):
     render_refresh_bar("dashboard")
@@ -1200,41 +1203,141 @@ def page_dashboard(conf: Dict[str, str], me: Dict):
     users_conf = get_users(conf)
     bm_logs = rows("bm_log") or []
 
-    totals = _user_total_with_bm(bets, bm_logs, users_conf)
+    # ▼ 既存（確定のみ）合計（参考として保持）
+    totals_settled = _user_total_with_bm(bets, bm_logs, users_conf)
+
+    # ▼ 新規：見込みを含めるか
+    include_proj = st.checkbox("見込みを含める（LIVE評価）", value=True)
+
+    # ▼ 以降、GWごとに「確定」「見込み」を集計
+    odds_rows = rows("odds") or []
+    all_gw = sorted({b.get("gw") for b in bets if b.get("gw")}, key=_gw_sort_key, reverse=True)
+
+    # ヘルパ：GW内の in→fd 対応とスコアを準備
+    def _prep_gw(gw_label: str):
+        in2fd = {}
+        gw_odds = [r for r in odds_rows if _gw_equal(r.get("gw"), gw_label)]
+        for r in gw_odds:
+            in_id = norm_id(r.get("match_id"))
+            fd_id = norm_id(r.get("fd_match_id"))
+            if fd_id:
+                in2fd[in_id] = fd_id
+        fd_ids = sorted({v for v in in2fd.values() if v})
+        scores = api_scores(conf, fd_ids) if fd_ids else {}
+        odds_by_fd = {norm_id(r.get("fd_match_id")): r for r in gw_odds if r.get("fd_match_id")}
+        def current_payout(b):
+            internal_mid = norm_id(b.get("match_id"))
+            fd = in2fd.get(internal_mid)
+            if not fd:
+                return 0.0
+            stake = parse_int(b.get("stake", 0))
+            pick = (b.get("pick") or "")
+            odds = parse_float(b.get("odds"), None)
+            if odds is None:
+                odrow = odds_by_fd.get(fd, {})
+                odds_key = {"HOME":"home_win","DRAW":"draw","AWAY":"away_win"}.get(pick)
+                odds = parse_float(odrow.get(odds_key), 1.0)
+            sc = scores.get(fd) or {}
+            status = (sc.get("status") or "").upper()
+            hs, as_ = parse_int(sc.get("home_score", 0), 0), parse_int(sc.get("away_score", 0), 0)
+            if status in ("SCHEDULED", "TIMED", "POSTPONED"):
+                return 0.0
+            if status in ("FINISHED", "AWARDED"):
+                winner = "DRAW" if hs == as_ else ("HOME" if hs > as_ else "AWAY")
+                return stake * odds if pick == winner else 0.0
+            if hs == as_:
+                return stake * odds if pick == "DRAW" else 0.0
+            winner_now = "HOME" if hs > as_ else "AWAY"
+            return stake * odds if pick == winner_now else 0.0
+        return in2fd, scores, current_payout
+
+    usernames = [u["username"] for u in users_conf]
+
+    # 全体累計（確定／見込み）をユーザー別に
+    agg_confirmed = {u: 0.0 for u in usernames}
+    agg_projected = {u: 0.0 for u in usernames}
+
+    # ▼ GWごとの内訳を保持して後で表示
+    gw_breakdowns = []  # [(gw_label, {user: (total, confirmed, projected)}, bm_user)]
+
+    for gw in all_gw:
+        gw_bets = [b for b in bets if _gw_equal(b.get("gw"), gw)]
+        if not gw_bets:
+            continue
+        in2fd, scores, curr_fn = _prep_gw(gw)
+        bm_user = get_bookmaker_for_gw(gw)
+
+        confirmed_by_user = {u: 0.0 for u in usernames}
+        projected_by_user = {u: 0.0 for u in usernames}
+
+        for u in usernames:
+            ub = [b for b in gw_bets if b.get("user") == u]
+            # 確定
+            for b in ub:
+                if (str(b.get("result") or "")).upper() in ("WIN", "LOSE"):
+                    stake = parse_int(b.get("stake", 0))
+                    payout = parse_float(b.get("payout"), None)
+                    if payout is None:
+                        odds = parse_float(b.get("odds"), 1.0) or 1.0
+                        payout = stake * odds if (str(b.get("result")).upper()=="WIN") else 0.0
+                    confirmed_by_user[u] += float(payout) - float(stake)
+            # 見込み（OPENのみ）
+            for b in ub:
+                if (str(b.get("status") or "")).upper() == "OPEN":
+                    projected_by_user[u] += curr_fn(b) - parse_int(b.get("stake", 0))
+
+        # BM 反映（確定／見込み）
+        if bm_user:
+            others_conf = sum(v for k, v in confirmed_by_user.items() if k != bm_user)
+            others_proj = sum(v for k, v in projected_by_user.items() if k != bm_user)
+            confirmed_by_user[bm_user] += -others_conf
+            projected_by_user[bm_user] += -others_proj
+
+        # 合計と集約
+        totals_by_user = {}
+        for u in usernames:
+            agg_confirmed[u] += confirmed_by_user[u]
+            agg_projected[u] += projected_by_user[u]
+            totals_by_user[u] = (confirmed_by_user[u] + projected_by_user[u], confirmed_by_user[u], projected_by_user[u])
+
+        gw_breakdowns.append((gw, totals_by_user, bm_user))
 
     my_name = me.get("username")
-    my_tot = totals.get(my_name, {"total_net": 0.0, "bet_net": 0.0, "bm_contrib": 0.0})
+    # 既存KPIの“トータル収支”表示を置換（確定＋見込み or 確定のみ）
+    my_confirmed = agg_confirmed.get(my_name, 0.0)
+    my_projected = agg_projected.get(my_name, 0.0) if include_proj else 0.0
+    total_net_display = my_confirmed + my_projected
 
-    # 既存のKPI枠を踏襲：トータル収支だけ BM 寄与込みに置換
+    # 従来表示の stake/payout は変更せず（確定値）
     my_bets = [b for b in bets if b.get("user") == my_name]
     total_stake = sum(parse_int(b.get("stake", 0)) for b in my_bets)
     total_payout = sum((parse_float(b.get("payout"), 0.0) or 0.0)
                        for b in my_bets if (b.get("result") in ["WIN", "LOSE"]))
-    total_net_display = my_tot["total_net"]  # ← BM寄与込み
 
     st.markdown(
         f"""
         <div class="kpi-row">
           <div class="kpi"><div class="h">トータル収支（{my_name}）</div><div class="v">{total_net_display:,.2f}</div></div>
-          <div class="kpi"><div class="h">総支出額（stake）</div><div class="v">{total_stake:,}</div></div>
-          <div class="kpi"><div class="h">トータル収入額（payout）</div><div class="v">{total_payout:,.2f}</div></div>
+          <div class="kpi"><div class="h">内訳：確定 / 見込み</div><div class="v">{my_confirmed:,.2f} / {my_projected:,.2f}</div></div>
+          <div class="kpi"><div class="h">総支出額（stake, 確定）</div><div class="v">{total_stake:,}</div></div>
+          <div class="kpi"><div class="h">トータル収入額（payout, 確定）</div><div class="v">{total_payout:,.2f}</div></div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    # 他ユーザー（参考）も「総収支=ベットnet+BM寄与」で表示
+    # 他ユーザー（参考）表示：合計（確定＋見込み or 確定のみ）
     all_usernames = [u["username"] for u in users_conf]
     others = [u for u in all_usernames if u != my_name]
     if others:
         st.markdown('<div class="section">他ユーザー（参考）</div>', unsafe_allow_html=True)
         cols = st.columns(max(2, min(4, len(others))))
         for i, u in enumerate(others):
+            unat_total = agg_confirmed.get(u, 0.0) + (agg_projected.get(u, 0.0) if include_proj else 0.0)
             ub = [b for b in bets if b.get("user") == u]
             ustake = sum(parse_int(b.get("stake", 0)) for b in ub)
             upayout = sum((parse_float(b.get("payout"), 0.0) or 0.0)
                           for b in ub if (b.get("result") in ["WIN", "LOSE"]))
-            unat_total = totals.get(u, {"total_net": 0.0})["total_net"]  # ← BM寄与込み
             with cols[i % len(cols)]:
                 st.markdown(
                     f'<div class="kpi"><div class="h">{u}</div>'
@@ -1243,45 +1346,20 @@ def page_dashboard(conf: Dict[str, str], me: Dict):
                     unsafe_allow_html=True
                 )
 
-    # 参考：ユーザー別の「的中率が高いチーム」表示は既存のロジックを維持
-    st.markdown('<div class="section">ユーザー別：的中率が高いチーム TOP3（最低3ベット）</div>', unsafe_allow_html=True)
-
-    by_team = {}
-    for b in my_bets:
-        if (b.get("result") or "").upper() not in ["WIN", "LOSE"]:
-            continue
-        pick = b.get("pick")
-        team = ""
-        if pick == "HOME":
-            team = b.get("match", "")
-        elif pick == "AWAY":
-            team = "AWAY"
-        else:
-            continue
-
-        by_team.setdefault(team, {"n": 0, "win": 0, "net": 0.0})
-        by_team[team]["n"] += 1
-        if (b.get("result") or "").upper() == "WIN":
-            by_team[team]["win"] += 1
-            by_team[team]["net"] += (parse_float(b.get("payout"), 0.0) or 0.0) - parse_int(b.get("stake", 0))
-        else:
-            by_team[team]["net"] -= parse_int(b.get("stake", 0))
-
-    stats = []
-    for t, v in by_team.items():
-        if v["n"] >= 3:
-            acc = v["win"] / v["n"]
-            stats.append((t, acc, v["n"], v["net"]))
-    if not stats:
-        st.caption("　対象データ不足（3ベット未満）")
-    else:
-        stats.sort(key=lambda x: (-x[1], -x[3]))
-        for t, acc, n, net in stats[:3]:
-            st.caption(f"　- {t}: 的中率 {acc*100:.1f}%（{n}件）／ 累計net {net:,.2f}")
+    # ▼ 追加：節ごとのユーザー別内訳（最新→過去）
+    st.markdown('<div class="section">節ごとのユーザー別内訳（合計 / 確定 / 見込み）</div>', unsafe_allow_html=True)
+    for gw, totals_by_user, bm_user in gw_breakdowns:
+        with st.expander(f"{gw}　{'（BM: ' + bm_user + '）' if bm_user else ''}", expanded=False):
+            for u in all_usernames:
+                tot, conf, proj = totals_by_user.get(u, (0.0, 0.0, 0.0))
+                if not include_proj:
+                    tot = conf  # トグルOFF時は確定のみの合計を見せる
+                st.caption(f"- {u}{'（BM）' if u==bm_user else ''}: 合計 {tot:,.2f} ／ 確定 {conf:,.2f} ／ 見込み {proj:,.2f}")
 
 # ------------------------------------------------------------
 # UI: オッズ管理（GW基準＝get_active_gw_label）
 #   ★ 変更：試合ごとの個別保存 → 「このGWのオッズを一括保存」に統一
+#   ★ 追加：fd_match_id を match_id と同時に保存
 # ------------------------------------------------------------
 def page_odds_admin(conf: Dict[str, str], me: Dict):
     render_refresh_bar("odds")
@@ -1348,6 +1426,7 @@ def page_odds_admin(conf: Dict[str, str], me: Dict):
                 row = {
                     "gw": gw,
                     "match_id": mid,
+                    "fd_match_id": mid,  # ★ 追加：初期値として同時保存
                     "home": m["home"],
                     "away": m["away"],
                     "home_win": f"{home}",
