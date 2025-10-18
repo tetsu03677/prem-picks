@@ -1022,6 +1022,7 @@ def page_history(conf: Dict[str, str], me: Dict):
 
 # ------------------------------------------------------------
 # UI: リアルタイム（GW基準＝get_active_gw_label）
+#   ★ 改修：今節の「全試合」（過去・進行中・未来）を対象に表示
 # ------------------------------------------------------------
 def page_realtime(conf: Dict[str, str], me: Dict):
     render_refresh_bar("realtime")
@@ -1031,15 +1032,17 @@ def page_realtime(conf: Dict[str, str], me: Dict):
     gw = get_active_gw_label(conf)
     matches_raw = _fetch_matches_by_gw_any(conf, gw)
 
+    # APIに載っている今節の全試合メタ
     api_ids = [norm_id(m["id"]) for m in matches_raw]
     api_meta = {norm_id(m["id"]): {"home": m["home"], "away": m["away"], "utc_kickoff": m.get("utc_kickoff")} for m in matches_raw}
 
+    # 今節の odds / bets を取得
     odds_rows = rows("odds")
     bets_rows = rows("bets")
-
     gw_odds = [r for r in odds_rows if str(r.get("gw", "")) == str(gw)]
     gw_bets = [r for r in bets_rows if str(r.get("gw", "")) == str(gw)]
 
+    # 内部match_id → API(fd)の対応
     in2fd = {}
     for r in gw_odds:
         in_id = norm_id(r.get("match_id"))
@@ -1050,6 +1053,7 @@ def page_realtime(conf: Dict[str, str], me: Dict):
     def has_teams(r):
         return bool(str(r.get("home","")).strip() and str(r.get("away","")).strip())
 
+    # odds/bets からも候補IDを補強
     odds_ids = [norm_id(r.get("fd_match_id")) for r in gw_odds if r.get("fd_match_id") and has_teams(r)]
     bet_ids = []
     for r in gw_bets:
@@ -1058,21 +1062,17 @@ def page_realtime(conf: Dict[str, str], me: Dict):
         if fd:
             bet_ids.append(fd)
 
+    # APIに無いが odds にチーム名がある試合はメタも補完
     for r in gw_odds:
         fd = norm_id(r.get("fd_match_id"))
         if fd and fd not in api_meta and has_teams(r):
             api_meta[fd] = {"home": r.get("home"), "away": r.get("away"), "utc_kickoff": None}
 
-    candidate_ids = sorted(list({*api_ids, *odds_ids, *bet_ids}))
+    # ★ 今節の全試合ID（過去・現在・未来すべて）
+    all_ids = sorted(list({*api_ids, *odds_ids, *bet_ids}))
 
-    scores = api_scores(conf, candidate_ids)
-
-    def is_active(fd):
-        s = scores.get(fd, {})
-        status = (s.get("status") or "").upper()
-        return status not in ("FINISHED", "AWARDED")
-
-    active_ids = [fd for fd in candidate_ids if is_active(fd)]
+    # スコア取得（結果・進行状況を含む）
+    scores = api_scores(conf, all_ids)
 
     odds_by_fd = {}
     for r in gw_odds:
@@ -1080,33 +1080,35 @@ def page_realtime(conf: Dict[str, str], me: Dict):
         if fd:
             odds_by_fd[fd] = r
 
+    # 時点ペイアウト（終了→確定値／進行中→現在スコア基準／未開始→0）
     def current_payout(b):
         internal_mid = norm_id(b.get("match_id"))
         fd = in2fd.get(internal_mid)
         if not fd:
             return 0.0
         stake = parse_int(b.get("stake", 0))
-        pick = b.get("pick", "")
+        pick = (b.get("pick") or "")
         odds = parse_float(b.get("odds"), None)
         if odds is None:
             odrow = odds_by_fd.get(fd, {})
             odds_key = {"HOME":"home_win","DRAW":"draw","AWAY":"away_win"}.get(pick)
             odds = parse_float(odrow.get(odds_key), 1.0)
-        sc = scores.get(fd)
-        if not sc:
-            return 0.0
-        status = sc.get("status")
-        hs, as_ = sc.get("home_score", 0), sc.get("away_score", 0)
+        sc = scores.get(fd) or {}
+        status = (sc.get("status") or "").upper()
+        hs, as_ = parse_int(sc.get("home_score", 0), 0), parse_int(sc.get("away_score", 0), 0)
+
         if status in ("SCHEDULED", "TIMED", "POSTPONED"):
             return 0.0
         if status in ("FINISHED", "AWARDED"):
             winner = "DRAW" if hs == as_ else ("HOME" if hs > as_ else "AWAY")
             return stake * odds if pick == winner else 0.0
+        # 進行中
         if hs == as_:
             return stake * odds if pick == "DRAW" else 0.0
         winner_now = "HOME" if hs > as_ else "AWAY"
         return stake * odds if pick == winner_now else 0.0
 
+    # KPI（今節の全ベットで集計）
     this_gw_bets = [b for b in bets_rows if (b.get("gw") == gw)]
     total_stake = sum(parse_int(b.get("stake", 0)) for b in this_gw_bets)
     total_curr = sum(current_payout(b) for b in this_gw_bets)
@@ -1123,6 +1125,7 @@ def page_realtime(conf: Dict[str, str], me: Dict):
         unsafe_allow_html=True,
     )
 
+    # ユーザー別の時点収支（BMは他メンバー合計のマイナス）
     users = sorted(list({b.get("user") for b in this_gw_bets if b.get("user")}))
     current_bm = get_bookmaker_for_gw(gw)
     if users:
@@ -1146,9 +1149,15 @@ def page_realtime(conf: Dict[str, str], me: Dict):
             upayout = sum(current_payout(b) for b in ub)
             unat = user_net.get(u, upayout - ustake)
             with cols[i % len(cols)]:
-                st.markdown(f'<div class="kpi"><div class="h">{u}{"（BM）" if u==current_bm else ""}</div><div class="v">{unat:,.2f}</div><div class="h">stake {ustake:,} / payout {upayout:,.2f}</div></div>', unsafe_allow_html=True)
+                st.markdown(
+                    f'<div class="kpi"><div class="h">{u}{"（BM）" if u==current_bm else ""}</div>'
+                    f'<div class="v">{unat:,.2f}</div>'
+                    f'<div class="h">stake {ustake:,} / payout {upayout:,.2f}</div></div>',
+                    unsafe_allow_html=True
+                )
 
-    st.markdown('<div class="section">試合別（現在スコアに基づく暫定：未開始＋進行中）</div>', unsafe_allow_html=True)
+    # ★ 試合別（今節の全試合：過去・進行中・未来）
+    st.markdown('<div class="section">試合別（現在スコアに基づく暫定：今節の全試合）</div>', unsafe_allow_html=True)
 
     def kickoff_key(fd):
         info = api_meta.get(fd, {})
@@ -1158,13 +1167,14 @@ def page_realtime(conf: Dict[str, str], me: Dict):
     def bet_fd(b):
         return in2fd.get(norm_id(b.get("match_id")))
 
-    for fd in sorted(active_ids, key=kickoff_key):
+    for fd in sorted(all_ids, key=kickoff_key):
         info = api_meta.get(fd)
         if not info:
             continue
-        s = scores.get(fd, {})
-        hs, as_ = s.get("home_score", 0), s.get("away_score", 0)
-        st.markdown(f"**{info['home']} vs {info['away']}**　（{s.get('status','-')}　{hs}-{as_}）")
+        s = scores.get(fd, {}) or {}
+        status = s.get("status", "-")
+        hs, as_ = parse_int(s.get("home_score", 0), 0), parse_int(s.get("away_score", 0), 0)
+        st.markdown(f"**{info['home']} vs {info['away']}**　（{status}　{hs}-{as_}）")
         rows_ = [b for b in this_gw_bets if bet_fd(b) == fd]
         if not rows_:
             st.caption("（ベットなし）")
